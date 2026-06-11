@@ -48,7 +48,8 @@ never by rewriting an accepted one.
 
 ### `40_bridge/` — The pipe (producer + consumer)
 - [40.01 PipeWire frame producer](40_bridge/40.01_producer.md) — the `bridge/` host that embeds core and renders offscreen; build/run/verify, perf (A+B done, C deferred)
-- [40.02 GNOME extension consumer](40_bridge/40.02_consumer.md) — the `extension/` that injects a PipeWire-fed Clutter actor into the background layer; design + the gnome-shell-in-sandbox blocker (first cut, unverified)
+- [40.02 GNOME extension consumer](40_bridge/40.02_consumer.md) — the `extension/` that injects a PipeWire-fed Clutter actor into the background layer; verified end-to-end in a nested session, with the hard-won GJS/GStreamer facts
+- [40.03 Live-session test runbook](40_bridge/40.03_live_session_runbook.md) — operator-run procedure to watch it on the real desktop: start order, expected logs, full recovery path, record-the-demo step
 
 ### `50_build_and_run/` — Build, run, requirements
 - [50.01 System requirements](50_build_and_run/50.01_system_requirements.md) — target machine, dependencies

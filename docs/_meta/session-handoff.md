@@ -249,3 +249,12 @@ done
   headless) — likely a careful live-session test (extension is contained;
   `gnome-extensions disable` is the escape hatch); producer node discovery;
   fit/crop modes; fullscreen-pause; producer lifecycle.
+
+- **Session 4 follow-up (2026-06-11): producer discovery + live runbook.**
+  The consumer now finds the producer by `node.name=wpe-host` via
+  `Gst.DeviceMonitor` (no `WWB_PIPEWIRE_PATH` needed; kept as debug
+  override). Verified in the nested session — frames flow with discovery.
+  Headless phase closed. Wrote `40_bridge/40.03_live_session_runbook.md`:
+  operator-run procedure to watch it on the real desktop (start order,
+  expected logs, Level 1/2/3 recovery, record-the-demo). **Next:** operator
+  runs 40.03 on the live session (assistant runs nothing against it).

@@ -80,6 +80,37 @@ function getCoglContext() {
     return null;
 }
 
+// The producer advertises this PW_KEY_NODE_NAME (see bridge/host/main.cpp).
+const PRODUCER_NODE_NAME = 'wpe-host';
+
+// Find the producer's PipeWire node by node.name among Video/Source devices.
+// Returns a Gst.Device (build the source from it via create_element) or null.
+// A bare pipewiresrc is not auto-linked to a Video/Source, so we must target
+// the producer explicitly; matching by name avoids depending on the volatile
+// node id.
+function findProducerDevice(wantName) {
+    const monitor = new Gst.DeviceMonitor();
+    monitor.add_filter('Video/Source', null);
+    if (!monitor.start()) {
+        log('wwb: DeviceMonitor.start failed');
+        return null;
+    }
+    let found = null;
+    for (const dev of monitor.get_devices()) {
+        let name = null;
+        try {
+            name = dev.get_properties()?.get_string('node.name');
+        } catch (e) {}
+        log(`wwb: video source "${dev.get_display_name()}" node.name=${name}`);
+        if (name === wantName) {
+            found = dev;
+            break;
+        }
+    }
+    monitor.stop();
+    return found;
+}
+
 export const LiveWallpaper = GObject.registerClass({
     GTypeName: 'WwbLiveWallpaper',
 }, class LiveWallpaper extends St.Widget {
@@ -124,21 +155,51 @@ export const LiveWallpaper = GObject.registerClass({
         if (!ensureGst())
             return;
 
-        const pathProp = this._path ? `path=${this._path} ` : '';
-        const desc =
-            `pipewiresrc ${pathProp}! videoconvert ! ` +
-            `video/x-raw,format=RGBA ! ` +
-            `appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false`;
+        // Override (debugging): explicit node id via WWB_PIPEWIRE_PATH.
+        // Otherwise discover the producer by node.name and build from its
+        // device — so the extension finds it without a hardcoded/volatile id.
+        if (this._path) {
+            const desc =
+                `pipewiresrc path=${this._path} ! videoconvert ! ` +
+                `video/x-raw,format=RGBA ! ` +
+                `appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false`;
+            try {
+                this._pipeline = Gst.parse_launch(desc);
+            } catch (e) {
+                logError(e, 'wwb: pipeline parse failed');
+                this._scheduleReconnect();
+                return;
+            }
+            this._appsink = this._pipeline.get_by_name('sink');
+            this._srcDesc = `path=${this._path}`;
+        } else {
+            const device = findProducerDevice(PRODUCER_NODE_NAME);
+            if (!device) {
+                log(`wwb: producer "${PRODUCER_NODE_NAME}" not found yet; will retry`);
+                this._scheduleReconnect();
+                return;
+            }
+            const src = device.create_element(null); // pipewiresrc targeted at the node
+            const conv = Gst.ElementFactory.make('videoconvert', null);
+            const capsf = Gst.ElementFactory.make('capsfilter', null);
+            capsf.set_property('caps', Gst.Caps.from_string('video/x-raw,format=RGBA'));
+            const sink = Gst.ElementFactory.make('appsink', 'sink');
+            sink.set_property('emit-signals', false);
+            sink.set_property('max-buffers', 1);
+            sink.set_property('drop', true);
+            sink.set_property('sync', false);
 
-        try {
-            this._pipeline = Gst.parse_launch(desc);
-        } catch (e) {
-            logError(e, 'wwb: pipeline parse failed');
-            this._scheduleReconnect();
-            return;
+            this._pipeline = Gst.Pipeline.new('wwb-pipeline');
+            for (const el of [src, conv, capsf, sink])
+                this._pipeline.add(el);
+            if (!src.link(conv) || !conv.link(capsf) || !capsf.link(sink)) {
+                log('wwb: failed to link pipeline elements');
+                this._scheduleReconnect();
+                return;
+            }
+            this._appsink = sink;
+            this._srcDesc = `node.name=${PRODUCER_NODE_NAME}`;
         }
-
-        this._appsink = this._pipeline.get_by_name('sink');
 
         // Watch for errors / end-of-stream (producer stopped) and reconnect.
         const bus = this._pipeline.get_bus();
@@ -156,7 +217,7 @@ export const LiveWallpaper = GObject.registerClass({
         });
 
         const ret = this._pipeline.set_state(Gst.State.PLAYING);
-        log(`wwb: pipeline "${desc}" set_state(PLAYING) => ${ret}`);
+        log(`wwb: pipeline (${this._srcDesc}) set_state(PLAYING) => ${ret}`);
 
         // Poll the sink on the main thread at ~30 Hz. Clutter is only touched
         // here, never on GStreamer's streaming thread.
@@ -172,7 +233,7 @@ export const LiveWallpaper = GObject.registerClass({
                 return GLib.SOURCE_REMOVE;
             const [, st] = this._pipeline.get_state(0);
             log(`wwb: 4s status — samples=${this._sampleCount || 0}, ` +
-                `pipelineState=${st}, path="${this._path || '(auto)'}"`);
+                `pipelineState=${st}, src=${this._srcDesc}`);
             return GLib.SOURCE_REMOVE;
         });
     }
