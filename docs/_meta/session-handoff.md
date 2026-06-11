@@ -141,5 +141,22 @@ done
   **Next coding session (3):** build the GNOME extension consumer against
   a dummy PipeWire source (`videotestsrc`) — independent of the producer
   decision, validates the hard GNOME-specific unknowns.
-  **Scratch on disk:** `next-v2-review/` worktree — remove with
-  `cd upstream && git worktree remove ../next-v2-review && git branch -D next-v2-review`.
+  **Scratch on disk:** `next-v2-review/` worktree.
+
+- **As of 2026-06-11, Session 3 Stage A done:** built the frame producer.
+  `bridge/host/main.cpp` embeds `linux-wallpaperengine-core` (pinned
+  `next-v2` @ `828485a`), creates a headless surfaceless-EGL GL 3.3 context,
+  renders a scene into a host-owned FBO via the embedding API, dumps PNGs.
+  Build: `bridge/build.sh` (one command; builds core with webhelper/
+  frontend/dev-viewer/tests OFF, then the host). Verified: core calls the
+  host time callback once/frame; frozen-clock frames are identical (MAD
+  0.000) while moving-clock frames differ — animation is genuinely
+  clock-driven. Perf (render-only, Intel UHD): astronaut ~20–26 ms/frame,
+  Frieren (5160x2160 scene) ~100 ms/frame. Full doc:
+  `40_bridge/40.01_producer.md`.
+  **The `next-v2-review/` worktree is now a build dependency of `bridge/`
+  — do not remove it.** Its `External/` submodules were initialized
+  (required for the core build); this does not touch our submodule pin
+  (`b016d7d`) or taint any committed tree.
+  **Stopped for operator review of the Stage A PNGs** before Stage B
+  (PipeWire/SHM output). Awaiting go-ahead.

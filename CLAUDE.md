@@ -50,8 +50,8 @@ the project is the bridge between it and GNOME on Wayland.
 - [x] Session 2: output abstraction mapped; `docs/30_rendering/30.01_output_backends.md` complete
 - [x] Session 2b: studied `next-v2` core API + issue #302; Q-9 answered (build on core, not `main`). See `30_rendering/30.02_next-v2-core-api.md`, `90_upstream/302-context.md`
 - [ ] Pending operator review: post `90_upstream/comment-pr609.md` on issue #302; decide Q-10 (separate project vs upstream contribution); revise ADR-0001/0003
-- [ ] Session 3: GNOME extension prototype consuming a dummy PipeWire stream (no renderer coupling)
-- [ ] Session 4: PipeWire bridge from a core-embedding host, zero-copy validated (Q-1 / ADR-0004)
+- [~] Session 3 (frame producer): **Stage A done** — `bridge/` host embeds core, renders offscreen via the embedding API; animation verified (frozen-clock determinism). See `docs/40_bridge/40.01_producer.md`. Stage B (PipeWire/SHM) and C (dma-buf) pending operator go-ahead.
+- [ ] Session 4: GNOME extension consuming the PipeWire stream
 
 Documentation scaffold is in place (vision, architecture, ADR-0001..0004,
 open questions). Decisions locked: English docs, name `we-wayland-bridge`,
@@ -67,7 +67,8 @@ maintainer plans an official extension — so Q-10 (differentiate via
 PipeWire vs contribute upstream) is now the pivotal decision, pending the
 #302 conversation.
 
-Temporary on disk (not committed; remove when done): `next-v2-review/` git
-worktree of the submodule at the PR #609 head. Clean up with
-`cd upstream && git worktree remove ../next-v2-review` then
-`git branch -D next-v2-review`.
+On disk, not committed: `next-v2-review/` git worktree of the submodule at
+the PR #609 head (`828485a`), with its `External/` submodules populated.
+**The `bridge/` host now builds against it — do not remove it** while
+working on the producer. `bridge/build/` and `bridge/out/` are gitignored
+build/render output. To rebuild from scratch: `bridge/build.sh`.

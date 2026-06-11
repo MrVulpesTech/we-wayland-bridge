@@ -45,6 +45,9 @@ never by rewriting an accepted one.
 - [Issue #302 context](90_upstream/302-context.md) — the canonical GNOME thread: maintainer's reasoning, GNOME tracker issues, and the existing @kv9898 window-clone solution
 - [Draft comment for #302](90_upstream/comment-pr609.md) — review-and-post-manually coordination comment
 
+### `40_bridge/` — The frame producer
+- [40.01 PipeWire frame producer](40_bridge/40.01_producer.md) — the `bridge/` host that embeds core and renders offscreen; build/run/verify, perf, staged plan (A done, B/C pending)
+
 ### `50_build_and_run/` — Build, run, requirements
 - [50.01 System requirements](50_build_and_run/50.01_system_requirements.md) — target machine, dependencies
 

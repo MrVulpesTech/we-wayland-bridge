@@ -1,0 +1,3 @@
+# Build output and rendered frames are not committed.
+build/
+out/
