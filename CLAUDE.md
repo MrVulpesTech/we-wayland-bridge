@@ -47,13 +47,27 @@ the project is the bridge between it and GNOME on Wayland.
 ## State
 
 - [x] Session 1: upstream built, two scene wallpapers render (see `docs/session-01-build.md`)
-- [ ] Session 2: `docs/30_rendering/30.01_output_backends.md` complete
-- [ ] Session 3: GNOME extension prototype with a test video stream
-- [ ] Session 4: PipeWire bridge, zero-copy validated (Q-1 / ADR-0004)
+- [x] Session 2: output abstraction mapped; `docs/30_rendering/30.01_output_backends.md` complete
+- [x] Session 2b: studied `next-v2` core API + issue #302; Q-9 answered (build on core, not `main`). See `30_rendering/30.02_next-v2-core-api.md`, `90_upstream/302-context.md`
+- [ ] Pending operator review: post `90_upstream/comment-pr609.md` on issue #302; decide Q-10 (separate project vs upstream contribution); revise ADR-0001/0003
+- [ ] Session 3: GNOME extension prototype consuming a dummy PipeWire stream (no renderer coupling)
+- [ ] Session 4: PipeWire bridge from a core-embedding host, zero-copy validated (Q-1 / ADR-0004)
 
 Documentation scaffold is in place (vision, architecture, ADR-0001..0004,
 open questions). Decisions locked: English docs, name `we-wayland-bridge`,
 no security/double-blind apparatus, fully open-source / public GitHub the
-goal (Q-5). Renderer builds clean on Ubuntu 26.04; scene rendering is the
-ground truth for everything downstream. Web (CEF) wallpapers did not run
-from the snap-confined VSCode terminal — out of MVP scope, retest later.
+goal (Q-5). Renderer builds clean on Ubuntu 26.04; scene rendering verified.
+
+Key shift from Session 2b: upstream `next-v2` (PR #609) ships an
+embeddable `linux-wallpaperengine-core` C library with an explicit
+offscreen render entry point (`wp_project_set_output_framebuffer`), so our
+frame producer should be a host that links core, not a renderer patch. But
+a working GNOME solution already exists (@kv9898 window-clone) and the
+maintainer plans an official extension — so Q-10 (differentiate via
+PipeWire vs contribute upstream) is now the pivotal decision, pending the
+#302 conversation.
+
+Temporary on disk (not committed; remove when done): `next-v2-review/` git
+worktree of the submodule at the PR #609 head. Clean up with
+`cd upstream && git worktree remove ../next-v2-review` then
+`git branch -D next-v2-review`.

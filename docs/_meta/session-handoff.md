@@ -103,3 +103,43 @@ done
   and document the backend interface in `30_rendering/30.01_output_backends.md`,
   then check upstream issues/PRs for an existing headless/PipeWire effort
   (Q-2).
+
+- **As of 2026-06-11, end of Session 2:** mapped the output abstraction
+  (VideoDriver + Output + OutputViewport; self-registering factories;
+  the GLFW driver already renders to a hidden window and has a
+  `glReadnPixels` read-back path). Two backend options documented (copy
+  via memfd vs zero-copy via dma-buf). **Major finding:** upstream PR
+  #609 (`next-v2`) is refactoring the renderer into an embeddable
+  `linux-wallpaperengine-core` library explicitly to support GNOME/KDE —
+  no competing PipeWire effort exists, but our integration should target
+  `next-v2`, not `main`. This reopens ADR-0001 and ADR-0003 (Q-9). Full
+  detail in `30_rendering/30.01_output_backends.md` §6.
+  **Next (Session 2b): fetch and read the `next-v2` branch** —
+  the `linux-wallpaperengine-core` API and its DE-integration docs —
+  then decide the ADR-0001/0003 revisions and comment on #609.
+
+- **As of 2026-06-11, end of Session 2b:** studied `next-v2` (PR #609) and
+  issue #302. Findings in `30_rendering/30.02_next-v2-core-api.md` and
+  `90_upstream/302-context.md`. Three things changed the project:
+  1. **Q-9 answered:** core exposes a C embedding API where the host owns
+     the GL context and hands core an FBO
+     (`wp_project_set_output_framebuffer` + `wp_render_frame`), verified
+     in `dev-viewer` and the frontend. Our producer = a host linking core
+     that renders into a dma-buf-backed texture and publishes PipeWire; no
+     renderer-internal patch. The `Drivers/Output` plan (30.01, for
+     `main`) is superseded by this.
+  2. **The `…-core` repo is not public yet** (404); core lives in
+     `next-v2/src/core`. Pin a `next-v2` commit (Q-11).
+  3. **Field is not empty (Q-10):** @kv9898 already has a working GNOME
+     wallpaper integration (window-clone, tested on GNOME 50.1/Ubuntu
+     26.04) and the maintainer intends an official extension. Our
+     differentiator is the PipeWire/dma-buf path. Whether that justifies a
+     separate project vs. contributing upstream is now the pivotal call.
+  **Operator actions pending (no code/posting done):** review and post
+  `90_upstream/comment-pr609.md` on issue #302; decide Q-10; then revise
+  ADR-0001/0003.
+  **Next coding session (3):** build the GNOME extension consumer against
+  a dummy PipeWire source (`videotestsrc`) — independent of the producer
+  decision, validates the hard GNOME-specific unknowns.
+  **Scratch on disk:** `next-v2-review/` worktree — remove with
+  `cd upstream && git worktree remove ../next-v2-review && git branch -D next-v2-review`.

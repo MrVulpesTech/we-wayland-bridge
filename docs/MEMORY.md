@@ -38,7 +38,12 @@ never by rewriting an accepted one.
 - [20.03 Component map](20_architecture/20.03_component_map.md) — process boundaries and the frame pipeline
 
 ### `30_rendering/` — Renderer and frame transport
-- [30.01 Output backends](30_rendering/30.01_output_backends.md) — survey of upstream output drivers and what a headless→PipeWire backend needs *(filled in Session 2)*
+- [30.01 Output backends](30_rendering/30.01_output_backends.md) — the renderer's output abstraction on current `main`, and two ways to add a PipeWire backend
+- [30.02 next-v2 core API](30_rendering/30.02_next-v2-core-api.md) — the embeddable C library in PR #609 (`wp_project_set_output_framebuffer`), the offscreen entry point, maturity, and the ADR recommendation matrix
+
+### `90_upstream/` — Coordinating with the upstream project
+- [Issue #302 context](90_upstream/302-context.md) — the canonical GNOME thread: maintainer's reasoning, GNOME tracker issues, and the existing @kv9898 window-clone solution
+- [Draft comment for #302](90_upstream/comment-pr609.md) — review-and-post-manually coordination comment
 
 ### `50_build_and_run/` — Build, run, requirements
 - [50.01 System requirements](50_build_and_run/50.01_system_requirements.md) — target machine, dependencies
