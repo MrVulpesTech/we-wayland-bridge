@@ -29,11 +29,11 @@ the project is the bridge between it and GNOME on Wayland.
   `extension/` is a separate process (IPC over PipeWire) and is MIT. Keep
   the boundary real. See `docs/_adr/ADR-0002-licensing.md`.
 - Test the extension **only** in a nested shell, never on the live
-  desktop. Note: `--nested` was **removed** in GNOME 50.1 (the brief's
-  `dbus-run-session -- gnome-shell --nested --wayland` no longer works);
-  the correct nested invocation is still to be confirmed on the live
-  session (the dev sandbox cannot launch gnome-shell — EBUSY / snap
-  confinement). See `extension/README.md`.
+  desktop. On GNOME 49+ `--nested` is gone; the nested shell is now the
+  Mutter Development Kit: `dbus-run-session -- gnome-shell --devkit --wayland`.
+  Run it from a **real terminal**, not the snap-confined VS Code one. The
+  assistant must **never** launch or `pkill` gnome-shell (it shares the
+  live session — a `pkill gnome-shell` once logged the operator out).
 - Follow `docs/_meta/writing-style.md` for all prose and comments
   (English only, no AI filler, no unmeasured performance numbers).
 - At the end of each session, update `docs/` and the "State" section
@@ -55,7 +55,7 @@ the project is the bridge between it and GNOME on Wayland.
 - [x] Session 2b: studied `next-v2` core API + issue #302; Q-9 answered (build on core, not `main`). See `30_rendering/30.02_next-v2-core-api.md`, `90_upstream/302-context.md`
 - [ ] Pending operator review: post `90_upstream/comment-pr609.md` on issue #302; decide Q-10 (separate project vs upstream contribution); revise ADR-0001/0003
 - [~] Session 3 (frame producer): **Stage A + B done** — `bridge/` host embeds core, renders offscreen, and publishes a PipeWire `Video/Source` (BGRx, SHM copy) consumed live by GStreamer (~21% CPU, ~40 fps, clean shutdown). See `docs/40_bridge/40.01_producer.md`. Stage C (dma-buf zero-copy, Q-1) pending operator go-ahead.
-- [~] Session 4 (GNOME extension consumer): **first cut written, UNVERIFIED** — `extension/` injects a `LiveWallpaper` into the background layer and consumes the PipeWire stream via GStreamer. Cannot run gnome-shell in the dev sandbox (EBUSY / snap), so the nested test is pending on the live session. See `extension/README.md`, `docs/40_bridge/40.02_consumer.md`.
+- [x] Session 4 (GNOME extension consumer): **pipeline VERIFIED end-to-end in a nested session** — `extension/` injects a `LiveWallpaper` into the background layer; frames flow renderer → PipeWire → `pipewiresrc`/appsink → `St.ImageContent` → Clutter actor (`wwb: first frame uploaded`, samples streaming) on GNOME 50.1 via the Mutter Devkit. **Q-1 answered** (frames reach GNOME via the SHM/PipeWire path). Tested headless, so not yet *watched* on a visible display; producer node-discovery and fit modes remain. See `docs/40_bridge/40.02_consumer.md`.
 
 Documentation scaffold is in place (vision, architecture, ADR-0001..0004,
 open questions). Decisions locked: English docs, name `we-wayland-bridge`,

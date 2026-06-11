@@ -20,6 +20,7 @@ import Cogl from 'gi://Cogl';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Gst from 'gi://Gst';
+import GstApp from 'gi://GstApp'; // registers GstAppSink methods (try_pull_sample)
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -53,6 +54,30 @@ export function probeShellApi() {
             log(`wwb: St.ImageContent construct failed: ${e}`);
         }
     }
+}
+
+// St.ImageContent.set_bytes needs a CoglContext. How to reach it varies across
+// Clutter/Mutter versions, so try the known paths and log which one works.
+function getCoglContext() {
+    const candidates = {
+        'stage.context.get_backend': () => global.stage.context.get_backend().get_cogl_context(),
+        'stage.get_context().get_backend': () => global.stage.get_context().get_backend().get_cogl_context(),
+        'backend.get_cogl_context': () => global.backend.get_cogl_context(),
+        'Clutter.get_default_backend': () => Clutter.get_default_backend().get_cogl_context(),
+    };
+    for (const [name, fn] of Object.entries(candidates)) {
+        try {
+            const ctx = fn();
+            if (ctx) {
+                log(`wwb: CoglContext via ${name}`);
+                return ctx;
+            }
+        } catch (e) {
+            log(`wwb: CoglContext ${name} -> ${e.message}`);
+        }
+    }
+    log('wwb: NO CoglContext found');
+    return null;
 }
 
 export const LiveWallpaper = GObject.registerClass({
@@ -130,13 +155,25 @@ export const LiveWallpaper = GObject.registerClass({
             }
         });
 
-        this._pipeline.set_state(Gst.State.PLAYING);
+        const ret = this._pipeline.set_state(Gst.State.PLAYING);
+        log(`wwb: pipeline "${desc}" set_state(PLAYING) => ${ret}`);
 
         // Poll the sink on the main thread at ~30 Hz. Clutter is only touched
         // here, never on GStreamer's streaming thread.
         this._pollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 33, () => {
             this._pullFrame();
             return GLib.SOURCE_CONTINUE;
+        });
+
+        // One-shot diagnostic: 4 s in, report whether any sample arrived and
+        // the pipeline's actual state, so a stalled video path is visible.
+        GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 4, () => {
+            if (this._destroyed || !this._pipeline)
+                return GLib.SOURCE_REMOVE;
+            const [, st] = this._pipeline.get_state(0);
+            log(`wwb: 4s status — samples=${this._sampleCount || 0}, ` +
+                `pipelineState=${st}, path="${this._path || '(auto)'}"`);
+            return GLib.SOURCE_REMOVE;
         });
     }
 
@@ -148,10 +185,18 @@ export const LiveWallpaper = GObject.registerClass({
         try {
             sample = sink.try_pull_sample(0); // non-blocking
         } catch (e) {
+            if (!this._loggedPullErr) {
+                this._loggedPullErr = true;
+                logError(e, 'wwb: try_pull_sample threw (appsink method missing?)');
+            }
             return;
         }
         if (!sample)
             return;
+
+        this._sampleCount = (this._sampleCount || 0) + 1;
+        if (this._sampleCount === 1)
+            log('wwb: first sample pulled from appsink');
 
         const caps = sample.get_caps();
         const s = caps.get_structure(0);
@@ -174,12 +219,16 @@ export const LiveWallpaper = GObject.registerClass({
     }
 
     _uploadFrame(bytes, width, height, stride) {
+        if (!this._coglContext)
+            this._coglContext = getCoglContext();
         if (!this._content) {
             this._content = new St.ImageContent();
             this.set_content(this._content);
         }
+        // set_bytes(cogl_context, data, pixel_format, width, height, row_stride).
         // RGBA from videoconvert; opaque (producer forces it).
         this._content.set_bytes(
+            this._coglContext,
             new GLib.Bytes(bytes),
             Cogl.PixelFormat.RGBA_8888,
             width, height, stride);

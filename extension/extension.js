@@ -12,16 +12,20 @@
 // separate process exposing a PipeWire stream, so there is no shell window to
 // hide. That removes the ~10 overview/Alt-Tab/app overrides they need.
 
+import GLib from 'gi://GLib';
+
 import * as Background from 'resource:///org/gnome/shell/ui/background.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension, InjectionManager} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 import {LiveWallpaper, probeShellApi} from './liveWallpaper.js';
 
-// PipeWire node to consume. Empty => let pipewiresrc auto-connect to a
-// compatible Video/Source (fine when the producer is the only one running).
-// Set to the producer's node id (it prints one) to be explicit.
-const PIPEWIRE_PATH = '';
+// PipeWire node id to consume. A bare pipewiresrc with no target is NOT
+// auto-linked to a Video/Source by WirePlumber (camera-like policy), so we
+// must name the producer's node. For testing it is read from the
+// WWB_PIPEWIRE_PATH env var (the producer prints its node id); a future
+// version discovers the producer by node.name. Empty => auto (rarely works).
+const PIPEWIRE_PATH = GLib.getenv('WWB_PIPEWIRE_PATH') || '';
 
 export default class WeWaylandBridgeExtension extends Extension {
     enable() {
@@ -42,6 +46,7 @@ export default class WeWaylandBridgeExtension extends Extension {
                 const ext = this;
                 return function () {
                     const backgroundActor = originalMethod.call(this);
+                    log(`wwb: _createBackgroundActor fired (monitor ${backgroundActor.monitor})`);
                     try {
                         const lw = new LiveWallpaper(backgroundActor, PIPEWIRE_PATH);
                         ext._wallpapers.add(lw);
@@ -54,11 +59,25 @@ export default class WeWaylandBridgeExtension extends Extension {
             }
         );
 
+        // Re-inject when the set of monitors changes (hotplug, or a monitor
+        // appearing after enable — e.g. a Mutter Devkit session that starts
+        // with none, or a display connected at runtime).
+        this._monitorsId = Main.layoutManager.connect('monitors-changed', () => {
+            log(`wwb: monitors-changed (${Main.layoutManager.monitors.length} monitors)`);
+            this._reloadBackgrounds();
+        });
+
         this._reloadBackgrounds();
-        log('wwb: enabled');
+        log(`wwb: enabled (${Main.layoutManager.monitors.length} monitors, ` +
+            `${this._wallpapers.size} wallpaper actors attached)`);
     }
 
     disable() {
+        if (this._monitorsId) {
+            Main.layoutManager.disconnect(this._monitorsId);
+            this._monitorsId = 0;
+        }
+
         this._injectionManager?.clear();
         this._injectionManager = null;
 

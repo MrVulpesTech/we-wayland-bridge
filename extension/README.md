@@ -51,12 +51,17 @@ require. That is the structural payoff of the PipeWire approach.
    ```
 
 3. Launch a **nested** shell and enable it there (do not enable on your
-   live session yet):
+   live session yet). On GNOME 49+ the nested shell is the Mutter
+   Development Kit (`--devkit`, not the removed `--nested`); run from a
+   real terminal, not the snap-confined VS Code one:
 
    ```sh
-   dbus-run-session -- gnome-shell --wayland   # see Caveats: exact flag TBD on GNOME 50.1
-   # in that session:
-   gnome-extensions enable we-wayland-bridge@we-wayland-bridge.github.io
+   dbus-run-session -- bash -c '
+     gnome-shell --devkit --wayland 2>&1 | grep --line-buffered -iE "wwb|error" &
+     sleep 10
+     gnome-extensions enable we-wayland-bridge@we-wayland-bridge.github.io
+     wait
+   '
    ```
 
 4. Capture the journal and look for these lines:
@@ -79,9 +84,11 @@ injection works and only the upload needs fixing — capture the probe line.
 
 - **Nested-shell command on GNOME 50.1.** The brief's
   `gnome-shell --nested --wayland` no longer works — `--nested` was
-  removed. Plain `--wayland` tried to become a full display server here
-  (`EBUSY`). The correct nested invocation needs confirming on a real
-  session; please report what works so the docs can be fixed.
+  removed in GNOME 49. The replacement is the Mutter Development Kit:
+  `dbus-run-session -- gnome-shell --devkit --wayland` (see GNOME 49/50
+  developer release notes). Plain `--wayland` tries to become a full
+  display server (`EBUSY`) and must not be used. Run from a real terminal,
+  not the snap-confined VS Code one.
 - **Frame-upload API unverified.** `St.ImageContent.set_bytes` is the
   assumed path; the probe line will confirm or send us to a Cogl-texture
   fallback.

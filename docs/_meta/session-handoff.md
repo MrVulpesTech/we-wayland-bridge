@@ -38,11 +38,15 @@ section of `CLAUDE.md`.
 - Renderer changes go on the `pipewire-backend` fork branch of
   `linux-wallpaperengine`, mirrored into `bridge/` as patches (ADR-0001).
 - Extension testing happens **only** in a nested shell, never on the live
-  desktop:
+  desktop. GNOME 49+ replaced `--nested` with the Mutter Development Kit
+  (`--devkit`); run from a real terminal, not the snap-confined VS Code one:
 
   ```sh
-  dbus-run-session -- gnome-shell --nested --wayland
+  dbus-run-session -- gnome-shell --devkit --wayland
   ```
+
+  The assistant must never launch or `pkill` gnome-shell — it shares the
+  operator's live session.
 
 - Every performance claim needs a session log behind it before it ships
   in a doc (writing-style §6). The zero-copy claim (Q-1) is unproven.
@@ -224,3 +228,24 @@ done
   **Did not touch the live desktop.** Probe extension was a throwaway in
   `~/.local/.../probe@wwb` (removal flaked on the sandbox; harmless,
   disabled — operator can `rm -rf` it).
+
+- **As of 2026-06-11, Session 4 — pipeline VERIFIED end-to-end (nested):**
+  the GNOME extension consumer works. Frames flow renderer → PipeWire →
+  `pipewiresrc`/appsink → `St.ImageContent.set_bytes` → Clutter actor in the
+  background layer (`wwb: first frame uploaded`, samples streaming) on GNOME
+  50.1 via the Mutter Devkit. Q-1 answered (SHM/PipeWire path reaches GNOME).
+  Hard-won facts (all in `40_bridge/40.02_consumer.md`):
+  1. Nested shell = `dbus-run-session -- gnome-shell --wayland --devkit
+     --virtual-monitor 1920x1080` (run from a real terminal; `--nested` is
+     gone; Devkit starts with 0 monitors without `--virtual-monitor`).
+  2. `appsink` needs `import GstApp` or `try_pull_sample` throws (silently,
+     if caught) → samples=0.
+  3. `St.ImageContent.set_bytes(coglContext, bytes, format, w, h, stride)` —
+     6 args, leading CoglContext.
+  4. CoglContext = `global.stage.context.get_backend().get_cogl_context()`.
+  5. `pipewiresrc` is NOT auto-linked to a Video/Source; needs `path=<id>`
+     (testing via `WWB_PIPEWIRE_PATH` env; production needs node-by-name).
+  **Remaining:** watch it on a visible display (`--virtual-monitor` is
+  headless) — likely a careful live-session test (extension is contained;
+  `gnome-extensions disable` is the escape hatch); producer node discovery;
+  fit/crop modes; fullscreen-pause; producer lifecycle.
