@@ -25,6 +25,7 @@ find_library(CORE_LIB
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
+pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
 find_package(GLEW REQUIRED)
 find_package(OpenGL REQUIRED)
 
@@ -37,6 +38,7 @@ target_include_directories(wpe-host PRIVATE
 target_link_libraries(wpe-host PRIVATE
     "${CORE_LIB}"
     PkgConfig::EGL
+    PkgConfig::PIPEWIRE
     GLEW::GLEW
     OpenGL::GL)
 

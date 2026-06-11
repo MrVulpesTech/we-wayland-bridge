@@ -158,5 +158,46 @@ done
   — do not remove it.** Its `External/` submodules were initialized
   (required for the core build); this does not touch our submodule pin
   (`b016d7d`) or taint any committed tree.
-  **Stopped for operator review of the Stage A PNGs** before Stage B
-  (PipeWire/SHM output). Awaiting go-ahead.
+  Stage A reviewed and committed (`3b04c37`).
+
+- **As of 2026-06-11, Session 3 Stage B done:** the host now also runs as a
+  PipeWire `Video/Source` (`--pipewire`, BGRx, timer-driven, SHM mapped
+  buffers, `glReadPixels` + row-flip copy). Verified end-to-end: a
+  GStreamer `pipewiresrc` consumer pulled live animated frames (correct
+  orientation, opaque); ~21% of one core CPU and ~40 fps at 1080p
+  (GPU-render-bound on the iGPU); clean SIGINT/SIGTERM shutdown. Demo:
+  `gst-launch-1.0 pipewiresrc path=<id> ! videoconvert ! autovideosink`
+  (the host prints the node id). Gotcha for the alpha fix: stream is BGRx
+  so the scene's alpha=0 is harmless. Doc: `40_bridge/40.01_producer.md`
+  (Stage B section + consumer requirements for Session 4: per-monitor
+  size, fill/fit/crop).
+  **Stopped for operator review at the Stage B checkpoint.** Next on
+  go-ahead: Stage C (gbm/dma-buf zero-copy, `eglExportDMABUFImageMESA`,
+  SHM kept as `--shm` fallback) — this is where Q-1 is actually proven.
+
+- **Stage B review fixes (2026-06-11):** operator reported the stream was
+  upside-down and (at the size they didn't use) washed-out. Two real
+  findings, both resolved/recorded:
+  1. **Orientation:** next-v2 core renders top-down, so the vertical flip
+     was wrong — removed (glReadPixels now writes straight into the mapped
+     buffer; one fewer copy). Verified at 1080p against the upstream
+     binary: astronaut at the bottom, flare rising. Correct.
+  2. **Resolution-dependent washout (Q-12):** scene `2804205787` renders
+     fully at 1920x1080 but washes to its white fog layer at ≤720p (red
+     flare/astronaut vanish). next-v2 **core** behaviour, not transport;
+     a clean upstream reproducer. Wallpapers run ≥1080p so impact is
+     limited. **Operator note:** always test the producer at 1080p+.
+  Operator never commits via the assistant — assistant provides `git add`
+  + commit message in chat only.
+
+- **Stage B fix #2 — buffer timestamps (2026-06-11):** operator's
+  `autovideosink` showed a frozen frame even at 1080p. Root cause: the
+  PipeWire buffers had no PTS, so a *synchronizing* sink displays only the
+  first frame (a non-syncing `multifilesink` consumer animated, which
+  masked it during my earlier verification). Fix: request a
+  `SPA_META_Header` on the stream's buffers and stamp `pts` (elapsed ns) +
+  `seq` each frame. Verified: a `fakesink sync=true` now renders buffers
+  with advancing PTS (0→5.6s, offsets 0→77). **Lesson: always verify a
+  video stream with a *synchronizing* sink, not just multifilesink.**
+  Operator must rebuild (`bridge/build.sh` or rebuild the host) and re-run
+  `bridge/demo.sh`.

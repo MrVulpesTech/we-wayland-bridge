@@ -50,7 +50,7 @@ the project is the bridge between it and GNOME on Wayland.
 - [x] Session 2: output abstraction mapped; `docs/30_rendering/30.01_output_backends.md` complete
 - [x] Session 2b: studied `next-v2` core API + issue #302; Q-9 answered (build on core, not `main`). See `30_rendering/30.02_next-v2-core-api.md`, `90_upstream/302-context.md`
 - [ ] Pending operator review: post `90_upstream/comment-pr609.md` on issue #302; decide Q-10 (separate project vs upstream contribution); revise ADR-0001/0003
-- [~] Session 3 (frame producer): **Stage A done** — `bridge/` host embeds core, renders offscreen via the embedding API; animation verified (frozen-clock determinism). See `docs/40_bridge/40.01_producer.md`. Stage B (PipeWire/SHM) and C (dma-buf) pending operator go-ahead.
+- [~] Session 3 (frame producer): **Stage A + B done** — `bridge/` host embeds core, renders offscreen, and publishes a PipeWire `Video/Source` (BGRx, SHM copy) consumed live by GStreamer (~21% CPU, ~40 fps, clean shutdown). See `docs/40_bridge/40.01_producer.md`. Stage C (dma-buf zero-copy, Q-1) pending operator go-ahead.
 - [ ] Session 4: GNOME extension consuming the PipeWire stream
 
 Documentation scaffold is in place (vision, architecture, ADR-0001..0004,
