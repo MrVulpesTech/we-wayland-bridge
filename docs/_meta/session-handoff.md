@@ -201,3 +201,26 @@ done
   video stream with a *synchronizing* sink, not just multifilesink.**
   Operator must rebuild (`bridge/build.sh` or rebuild the host) and re-run
   `bridge/demo.sh`.
+
+- **As of 2026-06-11, Session 4 (consumer) — first cut, UNVERIFIED:**
+  studied `gnome-ext-hanabi` and `@kv9898`'s fork. Big finding: both clone
+  a hidden window and need ~10 overrides to hide it; our PipeWire producer
+  has **no shell window**, so the consumer needs only the one injection
+  point (override `BackgroundManager._createBackgroundActor`, add our actor
+  to each background actor) — none of the window-hiding overhead. Wrote
+  `extension/` (MIT): `extension.js` + `liveWallpaper.js` —
+  `pipewiresrc ! videoconvert ! RGBA ! appsink`, polled on the shell main
+  thread, uploaded via `St.ImageContent.set_bytes`, solid-colour fallback,
+  reconnect on EOS. Design in `40_bridge/40.02_consumer.md`; run/test in
+  `extension/README.md`.
+  **Blocker:** the dev sandbox cannot launch gnome-shell — `--nested` is
+  removed in 50.1; `--wayland` → EBUSY (can't take the live seat);
+  `--headless` → gsettings schema crash. Same snap-confinement class as the
+  CEF block. So the extension is **untested**; the operator runs the nested
+  test on the live session and reports the `wwb:` journal lines (the API
+  probe + whether `first frame uploaded` or upload error), then the
+  frame-upload path is fixed from that. The correct GNOME 50.1 nested
+  command also needs confirming on the live session.
+  **Did not touch the live desktop.** Probe extension was a throwaway in
+  `~/.local/.../probe@wwb` (removal flaked on the sandbox; harmless,
+  disabled — operator can `rm -rf` it).

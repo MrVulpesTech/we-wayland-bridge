@@ -44,9 +44,11 @@ never by rewriting an accepted one.
 ### `90_upstream/` — Coordinating with the upstream project
 - [Issue #302 context](90_upstream/302-context.md) — the canonical GNOME thread: maintainer's reasoning, GNOME tracker issues, and the existing @kv9898 window-clone solution
 - [Draft comment for #302](90_upstream/comment-pr609.md) — review-and-post-manually coordination comment
+- [Q-12 bug report](90_upstream/q12-bug-report.md) — draft for PR #609: scene washes out to base layer at low output resolution
 
-### `40_bridge/` — The frame producer
-- [40.01 PipeWire frame producer](40_bridge/40.01_producer.md) — the `bridge/` host that embeds core and renders offscreen; build/run/verify, perf, staged plan (A done, B/C pending)
+### `40_bridge/` — The pipe (producer + consumer)
+- [40.01 PipeWire frame producer](40_bridge/40.01_producer.md) — the `bridge/` host that embeds core and renders offscreen; build/run/verify, perf (A+B done, C deferred)
+- [40.02 GNOME extension consumer](40_bridge/40.02_consumer.md) — the `extension/` that injects a PipeWire-fed Clutter actor into the background layer; design + the gnome-shell-in-sandbox blocker (first cut, unverified)
 
 ### `50_build_and_run/` — Build, run, requirements
 - [50.01 System requirements](50_build_and_run/50.01_system_requirements.md) — target machine, dependencies

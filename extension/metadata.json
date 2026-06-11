@@ -1,0 +1,8 @@
+{
+  "uuid": "we-wayland-bridge@we-wayland-bridge.github.io",
+  "name": "WE Wayland Bridge",
+  "description": "Shows a Wallpaper Engine scene as the desktop background by consuming the producer's PipeWire video stream into a Clutter actor in the background layer. Consumer side of we-wayland-bridge; the renderer runs as a separate process.",
+  "shell-version": ["50"],
+  "version": 1,
+  "url": "https://github.com/"
+}
