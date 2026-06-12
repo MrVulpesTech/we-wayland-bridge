@@ -145,10 +145,34 @@ export const LiveWallpaper = GObject.registerClass({
         if (Clutter.ContentGravity)
             this.set_content_gravity(Clutter.ContentGravity.RESIZE_FILL);
 
+        // Give the background actor a layout manager so our child is actually
+        // allocated to fill it. Meta.BackgroundActor has none by default, so a
+        // fixed-size child can end up unallocated/invisible (kv9898 does the
+        // same). BinLayout + x/y_expand makes the LiveWallpaper fill the
+        // monitor's background actor.
+        backgroundActor.layout_manager = new Clutter.BinLayout();
         backgroundActor.add_child(this);
-        log(`wwb: LiveWallpaper on monitor ${this._monitorIndex} (${this._w}x${this._h})`);
+        log(`wwb: LiveWallpaper on monitor ${this._monitorIndex} (${this._w}x${this._h}), ` +
+            `bgActor ${backgroundActor.width}x${backgroundActor.height} visible=${this.visible} opacity=${this.opacity}`);
 
-        this._start();
+        // Defer ALL GStreamer work (Gst.init, device discovery, pipeline) off
+        // the enable/startup path. Running it synchronously here blocked the
+        // shell main thread at login and caused a grey screen (40.04). Low
+        // priority + a small delay let the shell finish drawing first; if the
+        // deferred start is slow or throws, the shell is already up and stays
+        // responsive.
+        this._startId = GLib.timeout_add(GLib.PRIORITY_LOW, 1500, () => {
+            this._startId = 0;
+            if (this._destroyed)
+                return GLib.SOURCE_REMOVE;
+            try {
+                this._start();
+            } catch (e) {
+                logError(e, 'wwb: _start threw — idling, will retry');
+                this._scheduleReconnect();
+            }
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _start() {
@@ -242,6 +266,13 @@ export const LiveWallpaper = GObject.registerClass({
         const sink = this._appsink;
         if (!sink)
             return;
+        // Churn guard (40.04 Failure 2): when the actor is not mapped (e.g. the
+        // background isn't being painted), don't pull/upload — each upload is a
+        // full-frame buffer + texture allocation, so skipping when off-screen
+        // avoids needless GPU/memory pressure. (Stage C / dma-buf removes the
+        // per-frame copy entirely.)
+        if (!this.mapped)
+            return;
         let sample;
         try {
             sample = sink.try_pull_sample(0); // non-blocking
@@ -318,18 +349,40 @@ export const LiveWallpaper = GObject.registerClass({
             GLib.source_remove(this._pollId);
             this._pollId = 0;
         }
-        if (this._pipeline) {
-            try {
-                this._pipeline.get_bus()?.remove_signal_watch();
-            } catch (e) {}
-            this._pipeline.set_state(Gst.State.NULL);
-            this._pipeline = null;
-            this._appsink = null;
+        const pipeline = this._pipeline;
+        this._pipeline = null;
+        this._appsink = null;
+        if (!pipeline)
+            return;
+        // Tear down cleanly: drop the bus handler, drive to NULL, and WAIT for
+        // NULL before releasing the reference. Finalizing a pipewiresrc while
+        // still PLAYING crashed gnome-shell (SIGSEGV in libgstpipewire) — see
+        // docs/40_bridge/40.04. get_state() blocks until the transition lands
+        // (bounded), so libgstpipewire is fully stopped before GC.
+        try {
+            const bus = pipeline.get_bus();
+            if (bus) {
+                if (this._busId) {
+                    bus.disconnect(this._busId);
+                    this._busId = 0;
+                }
+                bus.remove_signal_watch();
+            }
+        } catch (e) {}
+        try {
+            pipeline.set_state(Gst.State.NULL);
+            pipeline.get_state(2000000000); // wait up to 2s (ns) for NULL
+        } catch (e) {
+            logError(e, 'wwb: pipeline teardown');
         }
     }
 
     destroy() {
         this._destroyed = true;
+        if (this._startId) {
+            GLib.source_remove(this._startId);
+            this._startId = 0;
+        }
         if (this._reconnectId) {
             GLib.source_remove(this._reconnectId);
             this._reconnectId = 0;

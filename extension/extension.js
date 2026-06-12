@@ -27,18 +27,50 @@ import {LiveWallpaper, probeShellApi} from './liveWallpaper.js';
 // version discovers the producer by node.name. Empty => auto (rarely works).
 const PIPEWIRE_PATH = GLib.getenv('WWB_PIPEWIRE_PATH') || '';
 
+// Kill-switch. If this file exists, the extension no-ops at enable. Lets the
+// operator stop a misbehaving extension from a TTY (`touch ~/.config/wwb/disabled`)
+// without removing it or reaching a (possibly grey) GNOME session.
+function killSwitchEngaged() {
+    try {
+        // WWB_FORCE=1 bypasses the kill-switch (for nested verification while
+        // the live session keeps the kill-switch file as a safety net).
+        if (GLib.getenv('WWB_FORCE'))
+            return false;
+        const path = GLib.build_filenamev([GLib.get_user_config_dir(), 'wwb', 'disabled']);
+        return GLib.file_test(path, GLib.FileTest.EXISTS);
+    } catch (e) {
+        return false;
+    }
+}
+
 export default class WeWaylandBridgeExtension extends Extension {
     enable() {
-        // One-time log of the shell-side API we have to work with, so the
-        // first run on a real session tells us which frame-upload path is
-        // available (we cannot probe this outside gnome-shell).
+        // Hard guard: nothing in enable() may throw or block. A grey-screen
+        // login (docs/40_bridge/40.04) was caused by enable-path work blocking
+        // the shell main thread; this wrapper, plus the LiveWallpaper deferring
+        // all GStreamer off the startup path, keep the shell safe.
+        try {
+            this._enableInner();
+        } catch (e) {
+            logError(e, 'wwb: enable() failed — extension is a no-op this session');
+            try { this._injectionManager?.clear(); } catch (_e) {}
+            this._injectionManager = null;
+        }
+    }
+
+    _enableInner() {
+        if (killSwitchEngaged()) {
+            log('wwb: kill-switch (~/.config/wwb/disabled) present — not enabling');
+            return;
+        }
+
         probeShellApi();
 
         this._injectionManager = new InjectionManager();
         this._wallpapers = new Set();
 
-        // Each monitor's BackgroundManager builds a background actor; we hang
-        // a LiveWallpaper off each one.
+        // Each monitor's BackgroundManager builds a background actor; we hang a
+        // LiveWallpaper off each one.
         this._injectionManager.overrideMethod(
             Background.BackgroundManager.prototype,
             '_createBackgroundActor',

@@ -258,3 +258,35 @@ done
   operator-run procedure to watch it on the real desktop (start order,
   expected logs, Level 1/2/3 recovery, record-the-demo). **Next:** operator
   runs 40.03 on the live session (assistant runs nothing against it).
+
+- **INCIDENT (2026-06-12): first live test froze the machine, then grey-screen
+  login loop.** Root cause (proven from journals): the extension ran
+  `Gst.init`/`Gst.DeviceMonitor` synchronously on the shell main thread at
+  login **with no producer running**, blocking the shell (cursor moved, UI
+  grey, portals timed out). It recurred every boot because it was in
+  `enabled-extensions`; recovery required physically removing the extension.
+  The original hard freeze (during live video) is unlogged; hypothesis is
+  per-frame texture/buffer churn (`St.ImageContent.set_bytes` every frame at
+  2560×1440 ≈ 420 MB/s) + iGPU load. Full writeup: `40_bridge/40.04`.
+  **Hardening done:** kill-switch (`~/.config/wwb/disabled`), `enable()`
+  fully guarded (no-op on throw), all GStreamer deferred off startup via a
+  low-priority timer and fail-open (no producer → log + idle + slow retry,
+  never block/throw), off-screen upload guard (`if (!this.mapped) return`),
+  source cleanup. `40.03` updated with preconditions + kill-switch recovery.
+  **NEXT: re-verify in a NESTED session, no-producer path especially (must
+  come up responsive, not grey). NO live retry until the operator says so.**
+  The assistant must not run gnome-shell.
+
+- **Incident fixed + verified (2026-06-12).** All three failure modes from
+  the live-test incident are resolved and re-verified in a nested session:
+  (1) grey-screen-at-login — deferred fail-open init, no hang with no
+  producer; (2) recovery — kill-switch `~/.config/wwb/disabled` (+`WWB_FORCE`
+  bypass for nested testing); (3) **the real one** — gnome-shell SIGSEGV in
+  libgstpipewire on pipeline teardown (= session end = the "freeze") — fixed
+  by clean teardown (drop bus handler → NULL → wait for NULL). Nested re-test:
+  producer-disconnect and clean disable both leave the shell ALIVE, no
+  SIGSEGV. `40.04` has the full diagnosis + architectural note (if in-shell
+  pipewiresrc ever proves fragile again, pivot to libpipewire+dma-buf→Cogl,
+  converging with Stage C). **Visual confirmation still needs the live session**
+  (`mutter-devkit` viewer is not packaged → nested is headless/log-only). A
+  careful live retry is now reasonable — operator's call, per 40.03.
