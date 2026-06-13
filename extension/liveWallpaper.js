@@ -1,18 +1,32 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 we-wayland-bridge contributors
 //
-// LiveWallpaper: a Clutter/St actor placed in a monitor's background actor
-// that paints frames pulled from a PipeWire video stream (the producer).
+// Two pieces:
+//   FrameSource   — ONE PipeWire pipeline + ONE Cogl texture for the whole
+//                   extension. Owns all GStreamer state and the only poll timer.
+//   LiveWallpaper — a thin Clutter/St actor placed in a monitor's background
+//                   actor that PAINTS the FrameSource's shared texture. It owns
+//                   no pipeline and no timer.
+//
+// Why the split (40.04): Background.BackgroundManager._createBackgroundActor is
+// called whenever a background actor is (re)built — opening the overview,
+// switching workspaces, monitor changes. An earlier design built a full
+// GStreamer pipeline per LiveWallpaper, so each overview toggle leaked another
+// pipeline + texture + timer; disposed actors' poll timers kept firing
+// ("already disposed" criticals), memory ran away, and the shell crashed. With
+// a single shared source, actors are cheap and disposable; only the source
+// touches GStreamer, exactly once.
 //
 // Design notes:
-//  - GStreamer's streaming thread must NOT touch Clutter/GJS objects. We poll
-//    the appsink from a GLib timer on the SHELL MAIN THREAD (try_pull_sample),
-//    so every Clutter call happens on the main loop. No cross-thread GJS.
-//  - Frame upload uses St.ImageContent.set_bytes. This file logs which
-//    shell-side API is actually available (probeShellApi) because it cannot
-//    be probed outside gnome-shell; if set_bytes is unavailable on a given
-//    release we adapt here.
-//  - A solid fallback colour is shown until the first frame, so the
+//  - GStreamer's streaming thread must NOT touch Clutter/GJS objects. The
+//    FrameSource polls the appsink from a GLib timer on the SHELL MAIN THREAD
+//    (try_pull_sample); every Clutter call happens on the main loop.
+//  - The shared texture is allocated on the first frame and updated in place
+//    (set_data) every frame thereafter — no per-frame allocation. Subscribers
+//    paint it directly in vfunc_paint_node (Clutter.TextureNode).
+//  - Churn guards (all 40.04 Failure 2): upload throttled to ~15 fps and paused
+//    entirely while the overview is open.
+//  - A solid fallback colour shows until the first frame, so the
 //    background-layer injection is verifiable independently of the video path.
 
 import Clutter from 'gi://Clutter';
@@ -24,6 +38,14 @@ import GstApp from 'gi://GstApp'; // registers GstAppSink methods (try_pull_samp
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+
+// Upload at most ~15 fps regardless of the producer's rate (40.04 Failure 2:
+// halve the per-frame GPU work vs the old 30 Hz poll). drop=true on the appsink
+// means we always get the most recent frame, never a backlog.
+const FRAME_INTERVAL_MS = 67; // 1000 / 15
+
+// The producer advertises this PW_KEY_NODE_NAME (see bridge/host/main.cpp).
+const PRODUCER_NODE_NAME = 'wpe-host';
 
 let _gstReady = false;
 function ensureGst() {
@@ -45,19 +67,11 @@ export function probeShellApi() {
     log(`wwb: API probe — St.ImageContent=${has(St.ImageContent)} ` +
         `Clutter.Image=${has(Clutter.Image)} ` +
         `Cogl.PixelFormat=${has(Cogl.PixelFormat)} ` +
-        `Clutter.ContentGravity=${has(Clutter.ContentGravity)}`);
-    if (St.ImageContent) {
-        try {
-            const ic = new St.ImageContent();
-            log(`wwb: St.ImageContent.set_bytes=${typeof ic.set_bytes}`);
-        } catch (e) {
-            log(`wwb: St.ImageContent construct failed: ${e}`);
-        }
-    }
+        `Clutter.TextureNode=${has(Clutter.TextureNode)}`);
 }
 
-// St.ImageContent.set_bytes needs a CoglContext. How to reach it varies across
-// Clutter/Mutter versions, so try the known paths and log which one works.
+// A CoglContext is needed to allocate/update the texture. How to reach it varies
+// across Clutter/Mutter versions, so try the known paths and log which worked.
 function getCoglContext() {
     const candidates = {
         'stage.context.get_backend': () => global.stage.context.get_backend().get_cogl_context(),
@@ -79,9 +93,6 @@ function getCoglContext() {
     log('wwb: NO CoglContext found');
     return null;
 }
-
-// The producer advertises this PW_KEY_NODE_NAME (see bridge/host/main.cpp).
-const PRODUCER_NODE_NAME = 'wpe-host';
 
 // Find the producer's PipeWire node by node.name among Video/Source devices.
 // Returns a Gst.Device (build the source from it via create_element) or null.
@@ -111,77 +122,97 @@ function findProducerDevice(wantName) {
     return found;
 }
 
-export const LiveWallpaper = GObject.registerClass({
-    GTypeName: 'WwbLiveWallpaper',
-}, class LiveWallpaper extends St.Widget {
-    _init(backgroundActor, pipewirePath) {
-        super._init({
-            reactive: false,
-            x_expand: true,
-            y_expand: true,
-        });
-
-        this._backgroundActor = backgroundActor;
+// One shared PipeWire pipeline + one shared Cogl texture for the whole
+// extension. Background actors subscribe via subscribe()/unsubscribe(); the
+// source redraws them after each new frame. Not a GObject — plain JS, owned by
+// the extension and explicitly start()/stop()ed.
+export class FrameSource {
+    constructor(pipewirePath) {
         this._path = pipewirePath || '';
-        this._monitorIndex = backgroundActor.monitor;
         this._pipeline = null;
         this._appsink = null;
+        this._busId = 0;
         this._pollId = 0;
         this._reconnectId = 0;
-        this._content = null;
+        this._srcDesc = '';
+        // The single reused texture (allocated on first frame, updated in place).
+        this._texture = null;
+        this._texW = 0;
+        this._texH = 0;
+        this._useSetData = true;
+        this._coglContext = null;
+        this._paused = false;
+        this._ovShowingId = 0;
+        this._ovHiddenId = 0;
+        this._subscribers = new Set();
+        this._sampleCount = 0;
         this._loggedUpload = false;
-
-        const monitor = Main.layoutManager.monitors[this._monitorIndex];
-        this._w = monitor?.width ?? backgroundActor.width;
-        this._h = monitor?.height ?? backgroundActor.height;
-        this.set_size(this._w, this._h);
-
-        // Visible until the first frame: proves the injection independently of
-        // the video path.
-        this.set_style('background-color: #0a0f1e;');
-
-        // Stretch the content to the monitor (MVP). 'fit'/'crop' modes are a
-        // follow-up; Clutter.ContentGravity.RESIZE_ASPECT gives letterbox-fit.
-        if (Clutter.ContentGravity)
-            this.set_content_gravity(Clutter.ContentGravity.RESIZE_FILL);
-
-        // Give the background actor a layout manager so our child is actually
-        // allocated to fill it. Meta.BackgroundActor has none by default, so a
-        // fixed-size child can end up unallocated/invisible (kv9898 does the
-        // same). BinLayout + x/y_expand makes the LiveWallpaper fill the
-        // monitor's background actor.
-        backgroundActor.layout_manager = new Clutter.BinLayout();
-        backgroundActor.add_child(this);
-        log(`wwb: LiveWallpaper on monitor ${this._monitorIndex} (${this._w}x${this._h}), ` +
-            `bgActor ${backgroundActor.width}x${backgroundActor.height} visible=${this.visible} opacity=${this.opacity}`);
-
-        // Defer ALL GStreamer work (Gst.init, device discovery, pipeline) off
-        // the enable/startup path. Running it synchronously here blocked the
-        // shell main thread at login and caused a grey screen (40.04). Low
-        // priority + a small delay let the shell finish drawing first; if the
-        // deferred start is slow or throws, the shell is already up and stays
-        // responsive.
-        this._startId = GLib.timeout_add(GLib.PRIORITY_LOW, 1500, () => {
-            this._startId = 0;
-            if (this._destroyed)
-                return GLib.SOURCE_REMOVE;
-            try {
-                this._start();
-            } catch (e) {
-                logError(e, 'wwb: _start threw — idling, will retry');
-                this._scheduleReconnect();
-            }
-            return GLib.SOURCE_REMOVE;
-        });
+        this._stopped = false;
     }
 
-    _start() {
-        if (!ensureGst())
+    get texture() {
+        return this._texture;
+    }
+
+    subscribe(actor) {
+        this._subscribers.add(actor);
+        // A late subscriber (e.g. the overview's background opening mid-stream)
+        // should paint the current frame immediately.
+        if (this._texture) {
+            try { actor.queue_redraw(); } catch (e) {}
+        }
+    }
+
+    unsubscribe(actor) {
+        this._subscribers.delete(actor);
+    }
+
+    // Begin discovery + streaming. Safe to call once, after the shell is up
+    // (the caller defers it off the enable path — see extension.js).
+    start() {
+        if (this._stopped)
+            return;
+        // Pause uploads while the overview is open. The overview blurs, scales,
+        // and desaturates every background — a large GL spike on the iGPU that,
+        // stacked on our texture upload, hard-locked the GPU (40.04 Failure 2).
+        try {
+            this._ovShowingId = Main.overview.connect('showing', () => {
+                this._paused = true;
+                log('wwb: overview showing — uploads paused');
+            });
+            this._ovHiddenId = Main.overview.connect('hidden', () => {
+                this._paused = false;
+                log('wwb: overview hidden — uploads resumed');
+            });
+        } catch (e) {
+            logError(e, 'wwb: could not connect overview pause signals');
+        }
+        this._startPipeline();
+    }
+
+    stop() {
+        this._stopped = true;
+        if (this._ovShowingId) {
+            Main.overview.disconnect(this._ovShowingId);
+            this._ovShowingId = 0;
+        }
+        if (this._ovHiddenId) {
+            Main.overview.disconnect(this._ovHiddenId);
+            this._ovHiddenId = 0;
+        }
+        if (this._reconnectId) {
+            GLib.source_remove(this._reconnectId);
+            this._reconnectId = 0;
+        }
+        this._teardownPipeline();
+        this._texture = null;
+        this._subscribers.clear();
+    }
+
+    _startPipeline() {
+        if (this._stopped || !ensureGst())
             return;
 
-        // Override (debugging): explicit node id via WWB_PIPEWIRE_PATH.
-        // Otherwise discover the producer by node.name and build from its
-        // device — so the extension finds it without a hardcoded/volatile id.
         if (this._path) {
             const desc =
                 `pipewiresrc path=${this._path} ! videoconvert ! ` +
@@ -243,35 +274,26 @@ export const LiveWallpaper = GObject.registerClass({
         const ret = this._pipeline.set_state(Gst.State.PLAYING);
         log(`wwb: pipeline (${this._srcDesc}) set_state(PLAYING) => ${ret}`);
 
-        // Poll the sink on the main thread at ~30 Hz. Clutter is only touched
-        // here, never on GStreamer's streaming thread.
-        this._pollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 33, () => {
+        // The ONLY poll timer in the extension. Throttled to ~15 fps.
+        this._pollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FRAME_INTERVAL_MS, () => {
             this._pullFrame();
             return GLib.SOURCE_CONTINUE;
         });
 
-        // One-shot diagnostic: 4 s in, report whether any sample arrived and
-        // the pipeline's actual state, so a stalled video path is visible.
+        // One-shot diagnostic: 4 s in, report whether any sample arrived.
         GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 4, () => {
-            if (this._destroyed || !this._pipeline)
+            if (this._stopped || !this._pipeline)
                 return GLib.SOURCE_REMOVE;
             const [, st] = this._pipeline.get_state(0);
-            log(`wwb: 4s status — samples=${this._sampleCount || 0}, ` +
-                `pipelineState=${st}, src=${this._srcDesc}`);
+            log(`wwb: 4s status — samples=${this._sampleCount}, ` +
+                `pipelineState=${st}, subscribers=${this._subscribers.size}, src=${this._srcDesc}`);
             return GLib.SOURCE_REMOVE;
         });
     }
 
     _pullFrame() {
         const sink = this._appsink;
-        if (!sink)
-            return;
-        // Churn guard (40.04 Failure 2): when the actor is not mapped (e.g. the
-        // background isn't being painted), don't pull/upload — each upload is a
-        // full-frame buffer + texture allocation, so skipping when off-screen
-        // avoids needless GPU/memory pressure. (Stage C / dma-buf removes the
-        // per-frame copy entirely.)
-        if (!this.mapped)
+        if (!sink || this._paused)
             return;
         let sample;
         try {
@@ -286,7 +308,7 @@ export const LiveWallpaper = GObject.registerClass({
         if (!sample)
             return;
 
-        this._sampleCount = (this._sampleCount || 0) + 1;
+        this._sampleCount += 1;
         if (this._sampleCount === 1)
             log('wwb: first sample pulled from appsink');
 
@@ -313,32 +335,53 @@ export const LiveWallpaper = GObject.registerClass({
     _uploadFrame(bytes, width, height, stride) {
         if (!this._coglContext)
             this._coglContext = getCoglContext();
-        if (!this._content) {
-            this._content = new St.ImageContent();
-            this.set_content(this._content);
+        const ctx = this._coglContext;
+        if (!ctx)
+            return;
+        const fmt = Cogl.PixelFormat.RGBA_8888;
+
+        // Allocate ONCE (or on a resolution change); update in place otherwise.
+        if (!this._texture || this._texW !== width || this._texH !== height) {
+            this._texture = Cogl.Texture2D.new_from_data(ctx, width, height, fmt, stride, bytes);
+            this._texW = width;
+            this._texH = height;
+            this._useSetData = true;
+        } else if (this._useSetData) {
+            try {
+                this._texture.set_data(fmt, stride, bytes, 0);
+            } catch (e) {
+                this._useSetData = false;
+                logError(e, 'wwb: Cogl texture set_data unavailable — recreating per frame');
+            }
         }
-        // set_bytes(cogl_context, data, pixel_format, width, height, row_stride).
-        // RGBA from videoconvert; opaque (producer forces it).
-        this._content.set_bytes(
-            this._coglContext,
-            new GLib.Bytes(bytes),
-            Cogl.PixelFormat.RGBA_8888,
-            width, height, stride);
+        if (!this._useSetData)
+            this._texture = Cogl.Texture2D.new_from_data(ctx, width, height, fmt, stride, bytes);
+
+        // Redraw every subscriber with the updated texture. Self-heal if a
+        // disposed actor lingers (its queue_redraw throws → drop it).
+        for (const actor of this._subscribers) {
+            try {
+                actor.queue_redraw();
+            } catch (e) {
+                this._subscribers.delete(actor);
+            }
+        }
+
         if (!this._loggedUpload) {
             this._loggedUpload = true;
-            log(`wwb: first frame uploaded (${width}x${height})`);
+            log(`wwb: first frame uploaded (${width}x${height}), setData=${this._useSetData}`);
         }
     }
 
     _scheduleReconnect() {
         this._teardownPipeline();
-        if (this._reconnectId)
+        if (this._stopped || this._reconnectId)
             return;
         this._reconnectId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
             this._reconnectId = 0;
-            if (!this._destroyed) {
-                log(`wwb: reconnecting on monitor ${this._monitorIndex}`);
-                this._start();
+            if (!this._stopped) {
+                log('wwb: reconnecting to producer');
+                this._startPipeline();
             }
             return GLib.SOURCE_REMOVE;
         });
@@ -357,8 +400,7 @@ export const LiveWallpaper = GObject.registerClass({
         // Tear down cleanly: drop the bus handler, drive to NULL, and WAIT for
         // NULL before releasing the reference. Finalizing a pipewiresrc while
         // still PLAYING crashed gnome-shell (SIGSEGV in libgstpipewire) — see
-        // docs/40_bridge/40.04. get_state() blocks until the transition lands
-        // (bounded), so libgstpipewire is fully stopped before GC.
+        // docs/40_bridge/40.04. get_state() blocks until the transition lands.
         try {
             const bus = pipeline.get_bus();
             if (bus) {
@@ -376,19 +418,71 @@ export const LiveWallpaper = GObject.registerClass({
             logError(e, 'wwb: pipeline teardown');
         }
     }
+}
 
-    destroy() {
-        this._destroyed = true;
-        if (this._startId) {
-            GLib.source_remove(this._startId);
-            this._startId = 0;
-        }
-        if (this._reconnectId) {
-            GLib.source_remove(this._reconnectId);
-            this._reconnectId = 0;
-        }
-        this._teardownPipeline();
-        this._content = null;
-        super.destroy();
+// A thin background-layer actor: paints the FrameSource's shared texture. Owns
+// no pipeline and no timer, so it is cheap to create/destroy as the shell
+// rebuilds background actors (overview, workspace and monitor changes).
+export const LiveWallpaper = GObject.registerClass({
+    GTypeName: 'WwbLiveWallpaper',
+}, class LiveWallpaper extends St.Widget {
+    _init(backgroundActor, source) {
+        super._init({
+            reactive: false,
+            x_expand: true,
+            y_expand: true,
+        });
+
+        this._source = source;
+        this._monitorIndex = backgroundActor.monitor;
+
+        const monitor = Main.layoutManager.monitors[this._monitorIndex];
+        const w = monitor?.width ?? backgroundActor.width;
+        const h = monitor?.height ?? backgroundActor.height;
+        this.set_size(w, h);
+
+        // Visible until the first frame paints over it: proves the injection
+        // independently of the video path. The opaque texture covers it.
+        this.set_style('background-color: #0a0f1e;');
+
+        // Meta.BackgroundActor has no layout manager, so a fixed-size child can
+        // end up unallocated/invisible. BinLayout + x/y_expand fills it.
+        backgroundActor.layout_manager = new Clutter.BinLayout();
+        backgroundActor.add_child(this);
+
+        // Clean up via the 'destroy' SIGNAL, not a destroy() override: when the
+        // shell disposes this actor as a child of a rebuilt background actor it
+        // emits 'destroy' but does not call a JS destroy() override — relying on
+        // the override leaked subscriptions and produced "already disposed"
+        // criticals (40.04).
+        this.connect('destroy', () => {
+            this._source?.unsubscribe(this);
+            this._source = null;
+        });
+
+        source.subscribe(this);
+        log(`wwb: LiveWallpaper on monitor ${this._monitorIndex} (${w}x${h}), ` +
+            `bgActor ${backgroundActor.width}x${backgroundActor.height}`);
+    }
+
+    vfunc_paint_node(node, paintContext) {
+        // CSS background first (placeholder colour before the first frame).
+        super.vfunc_paint_node(node, paintContext);
+        const texture = this._source?.texture;
+        if (!texture)
+            return;
+        const w = this.get_width();
+        const h = this.get_height();
+        if (w <= 0 || h <= 0)
+            return;
+        // Stretch to fill (MVP); 'fit'/'crop' modes adjust this rectangle later.
+        const tnode = new Clutter.TextureNode(
+            texture, null,
+            Clutter.ScalingFilter.LINEAR, Clutter.ScalingFilter.LINEAR);
+        const box = new Clutter.ActorBox();
+        box.set_origin(0, 0);
+        box.set_size(w, h);
+        tnode.add_rectangle(box);
+        node.add_child(tnode);
     }
 });
