@@ -26,6 +26,10 @@ find_library(CORE_LIB
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
 pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
+# Stage C: gbm allocates the dma-buf-backed output buffer; libdrm provides
+# drm_fourcc.h (DRM_FORMAT_* and modifier constants).
+pkg_check_modules(GBM REQUIRED IMPORTED_TARGET gbm)
+pkg_check_modules(DRM REQUIRED IMPORTED_TARGET libdrm)
 find_package(GLEW REQUIRED)
 find_package(OpenGL REQUIRED)
 
@@ -39,6 +43,8 @@ target_link_libraries(wpe-host PRIVATE
     "${CORE_LIB}"
     PkgConfig::EGL
     PkgConfig::PIPEWIRE
+    PkgConfig::GBM
+    PkgConfig::DRM
     GLEW::GLEW
     OpenGL::GL)
 

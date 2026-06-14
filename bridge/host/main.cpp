@@ -10,8 +10,10 @@
 // This file links the GPLv3 core library, so it is GPLv3 (ADR-0002). The GNOME
 // extension that will consume the PipeWire stream is a separate process (MIT).
 //
-// Stage B uses a glReadPixels->SHM copy path (correctness first). The dma-buf
-// zero-copy path is Stage C.
+// Stage B uses a glReadPixels->SHM copy path (correctness first). Stage C
+// (--dmabuf) backs the output FBO with a gbm/dma-buf so the frame never leaves
+// the GPU; C-1 (current) wires the allocation, EGL-image import, and dma-buf
+// export and verifies them in dump mode (no PipeWire changes yet).
 
 #include <cstdio>
 #include <cstdlib>
@@ -20,9 +22,15 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GL/glew.h>
+
+#include <gbm.h>
+#include <drm_fourcc.h>
 
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
@@ -80,6 +88,8 @@ struct Options {
     std::string out = "out";
     bool readback_all = false; // dump-mode benchmark: time glReadPixels each frame
     bool pipewire = false;     // Stage B: run as a PipeWire video source
+    bool dmabuf = false;       // Stage C: back the output FBO with a gbm/dma-buf
+    bool shm = false;          // force the SHM (glReadPixels) transport even with --dmabuf
 };
 
 Options parse_args (int argc, char** argv) {
@@ -105,28 +115,181 @@ Options parse_args (int argc, char** argv) {
         else if (a == "--out") o.out = next ();
         else if (a == "--readback-all") o.readback_all = true;
         else if (a == "--pipewire") o.pipewire = true;
+        else if (a == "--dmabuf") o.dmabuf = true;
+        else if (a == "--shm") o.shm = true;
         else if (a[0] == '-') die ("unknown flag");
         else o.wallpaper = a;
     }
     if (o.wallpaper.empty ())
-        die ("usage: wpe-host [--pipewire] [--assets-dir D] [--size WxH] "
+        die ("usage: wpe-host [--pipewire] [--dmabuf] [--shm] [--assets-dir D] [--size WxH] "
              "[--width W] [--height H] [--frames N] [--fps F] [--out DIR] <wallpaper-folder>");
     return o;
 }
 
 // ---------------------------------------------------------------------------
-// Shared GPU state: headless EGL context + host-owned output FBO.
+// Shared GPU state: headless EGL context + host-owned output FBO(s).
 // ---------------------------------------------------------------------------
+
+// Number of dma-buf buffers to pool for the PipeWire transport. A single shared
+// dma-buf deadlocks: the consumer holds the only buffer, so the producer's
+// dequeue returns null and it never renders into the buffer being read (the
+// consumer sees an empty buffer = black). A small pool lets the producer render
+// into a free buffer while the consumer holds another.
+constexpr int DMABUF_POOL_N = 4;
+
+// One dma-buf-backed render target: a gbm_bo imported as an EGL image and bound
+// to a GL texture + FBO. The GPU renders straight into the dma-buf.
+struct DmaBuf {
+    gbm_bo* bo = nullptr;
+    EGLImageKHR image = EGL_NO_IMAGE_KHR;
+    GLuint tex = 0;
+    GLuint fbo = 0;
+    int fd = -1; // the gbm_bo's dma-buf fd (we own it; dup'd per PipeWire buffer)
+    int stride = 0;
+    int offset = 0;
+    uint32_t fourcc = 0;
+    uint64_t modifier = 0;
+};
+
 struct Gfx {
     EGLDisplay dpy = EGL_NO_DISPLAY;
     EGLContext ctx = EGL_NO_CONTEXT;
-    GLuint texture = 0;
-    GLuint fbo = 0;
+    GLuint texture = 0; // non-dmabuf path
+    GLuint fbo = 0;     // current render target (non-dmabuf: the texture's FBO;
+                        // dmabuf: pool[i].fbo, switched per frame)
     int width = 0;
     int height = 0;
+
+    // Stage C: a pool of dma-buf render targets (when dmabuf == true).
+    bool dmabuf = false;
+    int drm_fd = -1; // /dev/dri/renderD128
+    gbm_device* gbm = nullptr;
+    std::vector<DmaBuf> pool;
 };
 
-void gfx_init (Gfx& g, int width, int height) {
+// EGL/GL entry points for the dma-buf path (Stage C), loaded on demand.
+PFNEGLCREATEIMAGEKHRPROC pf_eglCreateImageKHR = nullptr;
+PFNEGLDESTROYIMAGEKHRPROC pf_eglDestroyImageKHR = nullptr;
+PFNGLEGLIMAGETARGETTEXTURE2DOESPROC pf_glEGLImageTargetTexture2DOES = nullptr;
+PFNEGLEXPORTDMABUFIMAGEQUERYMESAPROC pf_eglExportDMABUFImageQueryMESA = nullptr;
+PFNEGLEXPORTDMABUFIMAGEMESAPROC pf_eglExportDMABUFImageMESA = nullptr;
+
+void load_dmabuf_procs () {
+    pf_eglCreateImageKHR = reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC> (eglGetProcAddress ("eglCreateImageKHR"));
+    pf_eglDestroyImageKHR = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC> (eglGetProcAddress ("eglDestroyImageKHR"));
+    pf_glEGLImageTargetTexture2DOES =
+        reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC> (eglGetProcAddress ("glEGLImageTargetTexture2DOES"));
+    pf_eglExportDMABUFImageQueryMESA =
+        reinterpret_cast<PFNEGLEXPORTDMABUFIMAGEQUERYMESAPROC> (eglGetProcAddress ("eglExportDMABUFImageQueryMESA"));
+    pf_eglExportDMABUFImageMESA =
+        reinterpret_cast<PFNEGLEXPORTDMABUFIMAGEMESAPROC> (eglGetProcAddress ("eglExportDMABUFImageMESA"));
+    if (!pf_eglCreateImageKHR || !pf_eglDestroyImageKHR || !pf_glEGLImageTargetTexture2DOES)
+        die ("dma-buf entry points unavailable (need EGL_EXT_image_dma_buf_import "
+             "+ GL_OES_EGL_image)");
+}
+
+std::string fourcc_str (uint32_t f) {
+    char c[5] = { char (f & 0xff), char ((f >> 8) & 0xff), char ((f >> 16) & 0xff), char ((f >> 24) & 0xff), 0 };
+    for (char& ch : c)
+        if (ch && (ch < 32 || ch > 126)) ch = '?';
+    return std::string (c);
+}
+
+// Create one dma-buf render target: gbm_bo (LINEAR, with fallbacks) imported as
+// an EGL image, bound to a texture + FBO. The GPU renders straight into the
+// dma-buf — no glReadPixels.
+DmaBuf create_dmabuf (EGLDisplay dpy, gbm_device* gbm, int w, int h, bool log) {
+    DmaBuf d;
+    // XBGR8888 = memory bytes R,G,B,X — same order GL writes for
+    // GL_RGBA8/UNSIGNED_BYTE (no swizzle) but with NO alpha. The scene renders
+    // alpha=0; an alpha format (ABGR8888) makes GL consumers premultiply the RGB
+    // to black. X = ignore => opaque, matching the RGBx wire format.
+    const uint32_t fmt = GBM_FORMAT_XBGR8888;
+    uint64_t linear = DRM_FORMAT_MOD_LINEAR;
+    const char* how = "with_modifiers(LINEAR)";
+    d.bo = gbm_bo_create_with_modifiers (gbm, w, h, fmt, &linear, 1);
+    if (!d.bo) {
+        how = "create(USE_RENDERING|USE_LINEAR)";
+        d.bo = gbm_bo_create (gbm, w, h, fmt, GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+    }
+    if (!d.bo) {
+        how = "create(USE_RENDERING, driver-picked modifier)";
+        d.bo = gbm_bo_create (gbm, w, h, fmt, GBM_BO_USE_RENDERING);
+    }
+    if (!d.bo) die ("gbm_bo_create failed (all strategies)");
+
+    d.fourcc = gbm_bo_get_format (d.bo);
+    d.modifier = gbm_bo_get_modifier (d.bo);
+    d.stride = static_cast<int> (gbm_bo_get_stride (d.bo));
+    d.offset = static_cast<int> (gbm_bo_get_offset (d.bo, 0));
+    d.fd = gbm_bo_get_fd (d.bo);
+    if (d.fd < 0) die ("gbm_bo_get_fd failed");
+    if (log)
+        std::fprintf (stderr,
+                      "gbm_bo via %s: %dx%d fourcc=%s(0x%08x) modifier=0x%016llx stride=%d offset=%d\n",
+                      how, w, h, fourcc_str (d.fourcc).c_str (), d.fourcc,
+                      static_cast<unsigned long long> (d.modifier), d.stride, d.offset);
+
+    EGLint attrs[32];
+    int n = 0;
+    attrs[n++] = EGL_WIDTH;  attrs[n++] = w;
+    attrs[n++] = EGL_HEIGHT; attrs[n++] = h;
+    attrs[n++] = EGL_LINUX_DRM_FOURCC_EXT;      attrs[n++] = static_cast<EGLint> (d.fourcc);
+    attrs[n++] = EGL_DMA_BUF_PLANE0_FD_EXT;     attrs[n++] = d.fd;
+    attrs[n++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT; attrs[n++] = d.offset;
+    attrs[n++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;  attrs[n++] = d.stride;
+    if (d.modifier != DRM_FORMAT_MOD_INVALID) {
+        attrs[n++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
+        attrs[n++] = static_cast<EGLint> (d.modifier & 0xffffffff);
+        attrs[n++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
+        attrs[n++] = static_cast<EGLint> (d.modifier >> 32);
+    }
+    attrs[n++] = EGL_NONE;
+
+    d.image = pf_eglCreateImageKHR (dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT,
+                                    static_cast<EGLClientBuffer> (nullptr), attrs);
+    if (d.image == EGL_NO_IMAGE_KHR) die ("eglCreateImageKHR(LINUX_DMA_BUF) failed");
+
+    glGenTextures (1, &d.tex);
+    glBindTexture (GL_TEXTURE_2D, d.tex);
+    pf_glEGLImageTargetTexture2DOES (GL_TEXTURE_2D, static_cast<GLeglImageOES> (d.image));
+    if (GLenum e = glGetError (); e != GL_NO_ERROR) {
+        std::fprintf (stderr, "glEGLImageTargetTexture2DOES GL error 0x%04x\n", e);
+        die ("binding EGL image to texture failed");
+    }
+    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glGenFramebuffers (1, &d.fbo);
+    glBindFramebuffer (GL_FRAMEBUFFER, d.fbo);
+    glFramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, d.tex, 0);
+    if (glCheckFramebufferStatus (GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        die ("dma-buf FBO incomplete");
+    return d;
+}
+
+// Open the render node, create a gbm device, and fill the dma-buf pool.
+void gfx_init_dmabuf_pool (Gfx& g, int count) {
+    const char* exts = eglQueryString (g.dpy, EGL_EXTENSIONS);
+    const bool has_import = exts && std::strstr (exts, "EGL_EXT_image_dma_buf_import");
+    std::fprintf (stderr, "EGL dma-buf import=%s\n", has_import ? "yes" : "no");
+    if (!has_import) die ("EGL display lacks EGL_EXT_image_dma_buf_import");
+    load_dmabuf_procs ();
+
+    g.drm_fd = open ("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    if (g.drm_fd < 0) die ("open(/dev/dri/renderD128) failed");
+    g.gbm = gbm_create_device (g.drm_fd);
+    if (!g.gbm) die ("gbm_create_device failed");
+
+    g.pool.reserve (count);
+    for (int i = 0; i < count; i++)
+        g.pool.push_back (create_dmabuf (g.dpy, g.gbm, g.width, g.height, i == 0));
+    g.fbo = g.pool[0].fbo; // initial render target
+    g.texture = g.pool[0].tex;
+    std::fprintf (stderr, "dma-buf pool: %d buffer(s)\n", count);
+}
+
+void gfx_init (Gfx& g, int width, int height, int pool_n) {
     g.width = width;
     g.height = height;
 
@@ -168,25 +331,44 @@ void gfx_init (Gfx& g, int width, int height) {
     glGetError ();
     std::fprintf (stderr, "GL renderer: %s\n", reinterpret_cast<const char*> (glGetString (GL_RENDERER)));
 
-    glGenTextures (1, &g.texture);
-    glBindTexture (GL_TEXTURE_2D, g.texture);
-    glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-    glGenFramebuffers (1, &g.fbo);
-    glBindFramebuffer (GL_FRAMEBUFFER, g.fbo);
-    glFramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g.texture, 0);
-    if (glCheckFramebufferStatus (GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-        die ("output FBO incomplete");
+    if (g.dmabuf) {
+        // Stage C: a pool of dma-buf-backed FBOs (zero-copy render targets).
+        gfx_init_dmabuf_pool (g, pool_n);
+    } else {
+        // Stage A/B: a plain GL-allocated RGBA8 texture + FBO (glReadPixels path).
+        glGenTextures (1, &g.texture);
+        glBindTexture (GL_TEXTURE_2D, g.texture);
+        glTexImage2D (GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri (GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glGenFramebuffers (1, &g.fbo);
+        glBindFramebuffer (GL_FRAMEBUFFER, g.fbo);
+        glFramebufferTexture2D (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g.texture, 0);
+        if (glCheckFramebufferStatus (GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            die ("output FBO incomplete");
+    }
 }
 
 void gfx_destroy (Gfx& g) {
-    glDeleteFramebuffers (1, &g.fbo);
-    glDeleteTextures (1, &g.texture);
+    if (g.dmabuf) {
+        for (DmaBuf& d : g.pool) {
+            if (d.fbo) glDeleteFramebuffers (1, &d.fbo);
+            if (d.tex) glDeleteTextures (1, &d.tex);
+            if (d.image != EGL_NO_IMAGE_KHR && pf_eglDestroyImageKHR)
+                pf_eglDestroyImageKHR (g.dpy, d.image);
+        }
+    } else {
+        glDeleteFramebuffers (1, &g.fbo);
+        glDeleteTextures (1, &g.texture);
+    }
     eglMakeCurrent (g.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     eglDestroyContext (g.dpy, g.ctx);
     eglTerminate (g.dpy);
+    // dma-buf resources (Stage C) — independent of EGL.
+    for (DmaBuf& d : g.pool)
+        if (d.fd >= 0) close (d.fd);
+    if (g.gbm) gbm_device_destroy (g.gbm);
+    if (g.drm_fd >= 0) close (g.drm_fd);
 }
 
 void render_frame (const Gfx& g, wp_context* ctx, wp_project* project) {
@@ -208,6 +390,8 @@ struct PwState {
     wp_project* project = nullptr;
     int fps = 60;
     double start_ms = 0.0;
+    bool dmabuf = false; // transport: dma-buf (zero-copy) vs SHM (glReadPixels)
+    int next_buf = 0;    // next pool index to hand out in pw_on_add_buffer
 };
 
 void pw_on_process (void* userdata) {
@@ -215,11 +399,8 @@ void pw_on_process (void* userdata) {
     pw_buffer* b = pw_stream_dequeue_buffer (s->stream);
     if (!b) return; // consumer has no free buffer yet; skip this tick
     spa_buffer* buf = b->buffer;
-    auto* dst = static_cast<unsigned char*> (buf->datas[0].data);
-    if (!dst) { pw_stream_queue_buffer (s->stream, b); return; }
 
     const int w = s->gfx->width, h = s->gfx->height;
-    const int stride = w * 4;
 
     if (s->start_ms == 0.0) s->start_ms = monotonic_ms ();
     const double elapsed_ms = monotonic_ms () - s->start_ms;
@@ -237,17 +418,32 @@ void pw_on_process (void* userdata) {
         hdr->offset = 0;
     }
 
-    render_frame (*s->gfx, s->ctx, s->project);
-
-    // GL origin is bottom-left; flip rows into the mapped buffer (top-left).
-    // BGRx: the x byte is ignored downstream, so the scene's alpha=0 is fine.
-    // next-v2 core already renders top-down into the FBO, so glReadPixels
-    // lands in the right orientation with no flip (verified against upstream).
-    glReadPixels (0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, dst);
-
-    buf->datas[0].chunk->offset = 0;
-    buf->datas[0].chunk->stride = stride;
-    buf->datas[0].chunk->size = static_cast<uint32_t> (stride) * h;
+    if (s->dmabuf) {
+        // Zero-copy: render straight into THIS buffer's dma-buf (the consumer
+        // imported its fd in pw_on_add_buffer). Rotate the core's output FBO to
+        // the dequeued pool entry. No glReadPixels.
+        const int idx = static_cast<int> (reinterpret_cast<intptr_t> (b->user_data));
+        DmaBuf& pb = s->gfx->pool[idx];
+        s->gfx->fbo = pb.fbo;
+        wp_project_set_output_framebuffer (s->project, pb.fbo);
+        render_frame (*s->gfx, s->ctx, s->project);
+        glFinish (); // GPU writes to the dma-buf must land before the consumer reads
+        buf->datas[0].chunk->offset = 0;
+        buf->datas[0].chunk->stride = pb.stride;
+        buf->datas[0].chunk->size = static_cast<uint32_t> (pb.stride) * h;
+    } else {
+        // SHM: render, then copy GPU->CPU into the mapped buffer (Stage B path).
+        auto* dst = static_cast<unsigned char*> (buf->datas[0].data);
+        if (!dst) { pw_stream_queue_buffer (s->stream, b); return; }
+        const int stride = w * 4;
+        render_frame (*s->gfx, s->ctx, s->project);
+        // BGRx: the x byte is ignored downstream, so the scene's alpha=0 is fine.
+        // next-v2 core renders top-down into the FBO, so no vertical flip.
+        glReadPixels (0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, dst);
+        buf->datas[0].chunk->offset = 0;
+        buf->datas[0].chunk->stride = stride;
+        buf->datas[0].chunk->size = static_cast<uint32_t> (stride) * h;
+    }
     pw_stream_queue_buffer (s->stream, b);
 
     // Report actual production rate once a second.
@@ -266,6 +462,57 @@ void pw_on_process (void* userdata) {
 
 void pw_on_timeout (void* userdata, uint64_t /*expirations*/) {
     pw_on_process (userdata);
+}
+
+// dma-buf transport: PipeWire created a buffer (PW_STREAM_FLAG_ALLOC_BUFFERS);
+// bind one pool entry's dma-buf fd to it and remember which entry, so
+// pw_on_process renders into the matching FBO.
+void pw_on_add_buffer (void* userdata, pw_buffer* b) {
+    auto* s = static_cast<PwState*> (userdata);
+    if (!s->dmabuf) return;
+    const int n = static_cast<int> (s->gfx->pool.size ());
+    const int idx = s->next_buf++ % n; // PipeWire may request fewer than the pool size
+    DmaBuf& pb = s->gfx->pool[idx];
+    spa_data* d = &b->buffer->datas[0];
+    d->type = SPA_DATA_DmaBuf;
+    d->flags = SPA_DATA_FLAG_READABLE;
+    d->fd = dup (pb.fd); // dup: the consumer/PipeWire closes its copy
+    d->mapoffset = 0;
+    d->maxsize = static_cast<uint32_t> (pb.stride * s->gfx->height);
+    d->data = nullptr;
+    d->chunk->offset = 0;
+    d->chunk->stride = pb.stride;
+    d->chunk->size = d->maxsize;
+    b->user_data = reinterpret_cast<void*> (static_cast<intptr_t> (idx));
+    std::fprintf (stderr, "dma-buf buffer[%d] attached: fd=%d (dup of %d) stride=%d\n",
+                  idx, static_cast<int> (d->fd), pb.fd, pb.stride);
+}
+
+void pw_on_remove_buffer (void* userdata, pw_buffer* b) {
+    auto* s = static_cast<PwState*> (userdata);
+    if (!s->dmabuf) return;
+    spa_data* d = &b->buffer->datas[0];
+    if (d->fd >= 0) { close (static_cast<int> (d->fd)); d->fd = -1; }
+}
+
+// Build a dma-buf EnumFormat pod: RGBx (opaque; the dma-buf is ABGR8888, same
+// byte layout, x ignores the scene's alpha=0) with a mandatory LINEAR modifier
+// — the modifier property is what signals "this is dma-buf" to the consumer.
+const spa_pod* build_format_dmabuf (spa_pod_builder* bld, int w, int h, int fps) {
+    spa_rectangle size = SPA_RECTANGLE (static_cast<uint32_t> (w), static_cast<uint32_t> (h));
+    spa_fraction rate = SPA_FRACTION (static_cast<uint32_t> (fps), 1);
+    spa_pod_frame f;
+    spa_pod_builder_push_object (bld, &f, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+    spa_pod_builder_add (bld,
+        SPA_FORMAT_mediaType, SPA_POD_Id (SPA_MEDIA_TYPE_video),
+        SPA_FORMAT_mediaSubtype, SPA_POD_Id (SPA_MEDIA_SUBTYPE_raw),
+        SPA_FORMAT_VIDEO_format, SPA_POD_Id (SPA_VIDEO_FORMAT_RGBx), 0);
+    spa_pod_builder_prop (bld, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+    spa_pod_builder_long (bld, DRM_FORMAT_MOD_LINEAR);
+    spa_pod_builder_add (bld,
+        SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle (&size),
+        SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction (&rate), 0);
+    return static_cast<const spa_pod*> (spa_pod_builder_pop (bld, &f));
 }
 
 void pw_on_state_changed (void* userdata, pw_stream_state /*old*/, pw_stream_state state, const char* error) {
@@ -287,20 +534,36 @@ void pw_on_param_changed (void* userdata, uint32_t id, const spa_pod* param) {
     auto* s = static_cast<PwState*> (userdata);
     if (param == nullptr || id != SPA_PARAM_Format) return;
 
-    const int stride = s->gfx->width * 4;
-    const int size = stride * s->gfx->height;
-
     uint8_t buffer[1024];
     spa_pod_builder bld = SPA_POD_BUILDER_INIT (buffer, sizeof (buffer));
     const spa_pod* params[2];
-    params[0] = static_cast<const spa_pod*> (spa_pod_builder_add_object (
-        &bld, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-        SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int (8, 2, 16),
-        SPA_PARAM_BUFFERS_blocks, SPA_POD_Int (1),
-        SPA_PARAM_BUFFERS_size, SPA_POD_Int (size),
-        SPA_PARAM_BUFFERS_stride, SPA_POD_Int (stride),
-        SPA_PARAM_BUFFERS_dataType,
-        SPA_POD_CHOICE_FLAGS_Int ((1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr))));
+    if (s->dmabuf) {
+        // A pool of dma-buf buffers (blocks=1 each). At least 2 so the producer
+        // and consumer never fight over a single buffer (the deadlock that left
+        // the consumer reading an empty buffer). The consumer imports the fd set
+        // in pw_on_add_buffer.
+        const int n = static_cast<int> (s->gfx->pool.size ());
+        const int stride = s->gfx->pool[0].stride;
+        const int size = stride * s->gfx->height;
+        params[0] = static_cast<const spa_pod*> (spa_pod_builder_add_object (
+            &bld, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+            SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int (n, 2, n),
+            SPA_PARAM_BUFFERS_blocks, SPA_POD_Int (1),
+            SPA_PARAM_BUFFERS_size, SPA_POD_Int (size),
+            SPA_PARAM_BUFFERS_stride, SPA_POD_Int (stride),
+            SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int (1 << SPA_DATA_DmaBuf)));
+    } else {
+        const int stride = s->gfx->width * 4;
+        const int size = stride * s->gfx->height;
+        params[0] = static_cast<const spa_pod*> (spa_pod_builder_add_object (
+            &bld, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+            SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int (8, 2, 16),
+            SPA_PARAM_BUFFERS_blocks, SPA_POD_Int (1),
+            SPA_PARAM_BUFFERS_size, SPA_POD_Int (size),
+            SPA_PARAM_BUFFERS_stride, SPA_POD_Int (stride),
+            SPA_PARAM_BUFFERS_dataType,
+            SPA_POD_CHOICE_FLAGS_Int ((1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr))));
+    }
     // Ask PipeWire to allocate a header meta on each buffer (for PTS).
     params[1] = static_cast<const spa_pod*> (spa_pod_builder_add_object (
         &bld, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
@@ -327,6 +590,7 @@ int run_pipewire (const Options& opt, Gfx& gfx, wp_context* ctx, wp_project* pro
     s.ctx = ctx;
     s.project = project;
     s.fps = opt.fps;
+    s.dmabuf = opt.dmabuf && !opt.shm; // dma-buf FBO + not forced back to SHM
     s.loop = pw_main_loop_new (nullptr);
     if (!s.loop) die ("pw_main_loop_new failed");
 
@@ -344,26 +608,35 @@ int run_pipewire (const Options& opt, Gfx& gfx, wp_context* ctx, wp_project* pro
     events.state_changed = pw_on_state_changed;
     events.param_changed = pw_on_param_changed;
     events.process = pw_on_process;
+    events.add_buffer = pw_on_add_buffer;       // dma-buf: provide the fd
+    events.remove_buffer = pw_on_remove_buffer;  // dma-buf: close our dup'd fd
 
     s.stream = pw_stream_new_simple (l, "wpe-host", props, &events, &s);
     if (!s.stream) die ("pw_stream_new_simple failed");
 
     uint8_t buffer[512];
     spa_pod_builder bld = SPA_POD_BUILDER_INIT (buffer, sizeof (buffer));
-    spa_video_info_raw info {};
-    info.format = SPA_VIDEO_FORMAT_BGRx;
-    info.size = SPA_RECTANGLE (static_cast<uint32_t> (opt.width), static_cast<uint32_t> (opt.height));
-    info.framerate = SPA_FRACTION (static_cast<uint32_t> (opt.fps), 1);
     const spa_pod* params[1];
-    params[0] = spa_format_video_raw_build (&bld, SPA_PARAM_EnumFormat, &info);
+    pw_stream_flags flags;
+    if (s.dmabuf) {
+        params[0] = build_format_dmabuf (&bld, opt.width, opt.height, opt.fps);
+        // ALLOC_BUFFERS: we hand PipeWire the dma-buf fd (pw_on_add_buffer). No
+        // MAP_BUFFERS — a dma-buf is not mmap'd by the producer.
+        flags = static_cast<pw_stream_flags> (PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_ALLOC_BUFFERS);
+    } else {
+        spa_video_info_raw info {};
+        info.format = SPA_VIDEO_FORMAT_BGRx;
+        info.size = SPA_RECTANGLE (static_cast<uint32_t> (opt.width), static_cast<uint32_t> (opt.height));
+        info.framerate = SPA_FRACTION (static_cast<uint32_t> (opt.fps), 1);
+        params[0] = spa_format_video_raw_build (&bld, SPA_PARAM_EnumFormat, &info);
+        flags = static_cast<pw_stream_flags> (PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS);
+    }
 
-    if (pw_stream_connect (s.stream, PW_DIRECTION_OUTPUT, PW_ID_ANY,
-                           static_cast<pw_stream_flags> (PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS),
-                           params, 1) < 0)
+    if (pw_stream_connect (s.stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, flags, params, 1) < 0)
         die ("pw_stream_connect failed");
 
-    std::fprintf (stderr, "PipeWire source running at %dx%d@%dfps (BGRx). Ctrl-C to stop.\n",
-                  opt.width, opt.height, opt.fps);
+    std::fprintf (stderr, "PipeWire source running at %dx%d@%dfps (%s). Ctrl-C to stop.\n",
+                  opt.width, opt.height, opt.fps, s.dmabuf ? "dma-buf RGBx/LINEAR" : "SHM BGRx");
     pw_main_loop_run (s.loop);
 
     pw_stream_destroy (s.stream);
@@ -394,7 +667,8 @@ int run_dump (const Options& opt, Gfx& gfx, wp_context* ctx, wp_project* project
             std::fprintf (stderr, "scene intrinsic size after first render: %dx%d\n",
                           wp_project_get_width (project), wp_project_get_height (project));
 
-        const bool dump = (frame == 1 || frame == 60 || frame == 120);
+        // Frame 5 is the Stage C-1 content check (a short --frames 10 run).
+        const bool dump = (frame == 1 || frame == 60 || frame == 120) || (gfx.dmabuf && frame == 5);
         if (opt.readback_all) {
             glBindFramebuffer (GL_FRAMEBUFFER, gfx.fbo);
             double r0 = monotonic_ms ();
@@ -430,7 +704,11 @@ int main (int argc, char** argv) {
     Options opt = parse_args (argc, argv);
 
     Gfx gfx;
-    gfx_init (gfx, opt.width, opt.height);
+    gfx.dmabuf = opt.dmabuf;
+    // A pool is only needed for the dma-buf PipeWire transport; the dump and
+    // SHM paths use a single buffer.
+    const int pool_n = (opt.dmabuf && opt.pipewire && !opt.shm) ? DMABUF_POOL_N : 1;
+    gfx_init (gfx, opt.width, opt.height, pool_n);
 
     wp_configuration* config = wp_config_create ();
     if (!wp_config_set_assets_dir (config, opt.assets.c_str ()))
