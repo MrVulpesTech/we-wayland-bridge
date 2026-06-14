@@ -44,6 +44,13 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 // means we always get the most recent frame, never a backlog.
 const FRAME_INTERVAL_MS = 67; // 1000 / 15
 
+// Producer frames are BGRx → videoconvert → RGBA, but the alpha byte can arrive
+// as 0 (fully transparent), which paints an invisible texture. Upload in an X
+// (ignore-alpha) format so the texture is always opaque; the RGB bytes sit in
+// the same positions. Fall back to RGBA if the X format is unavailable.
+const UPLOAD_FORMAT =
+    (Cogl.PixelFormat && Cogl.PixelFormat.RGBX_8888) || Cogl.PixelFormat.RGBA_8888;
+
 // The producer advertises this PW_KEY_NODE_NAME (see bridge/host/main.cpp).
 const PRODUCER_NODE_NAME = 'wpe-host';
 
@@ -68,6 +75,30 @@ export function probeShellApi() {
         `Clutter.Image=${has(Clutter.Image)} ` +
         `Cogl.PixelFormat=${has(Cogl.PixelFormat)} ` +
         `Clutter.TextureNode=${has(Clutter.TextureNode)}`);
+}
+
+// A white modulation colour for Clutter.TextureNode. Passing null can make the
+// node paint the texture modulated by transparent black (i.e. invisible), so we
+// hand it an explicit opaque white. Built once; format varies across Cogl, so
+// try both initialisers.
+let _whiteColor;
+function whiteColor() {
+    if (_whiteColor !== undefined)
+        return _whiteColor;
+    _whiteColor = null;
+    try {
+        const c = new Cogl.Color();
+        if (typeof c.init_from_4f === 'function')
+            c.init_from_4f(1.0, 1.0, 1.0, 1.0);
+        else if (typeof c.init_from_4ub === 'function')
+            c.init_from_4ub(255, 255, 255, 255);
+        else
+            return _whiteColor;
+        _whiteColor = c;
+    } catch (e) {
+        log(`wwb: white CoglColor construction failed: ${e}`);
+    }
+    return _whiteColor;
 }
 
 // A CoglContext is needed to allocate/update the texture. How to reach it varies
@@ -338,7 +369,7 @@ export class FrameSource {
         const ctx = this._coglContext;
         if (!ctx)
             return;
-        const fmt = Cogl.PixelFormat.RGBA_8888;
+        const fmt = UPLOAD_FORMAT;
 
         // Allocate ONCE (or on a resolution change); update in place otherwise.
         if (!this._texture || this._texW !== width || this._texH !== height) {
@@ -369,7 +400,9 @@ export class FrameSource {
 
         if (!this._loggedUpload) {
             this._loggedUpload = true;
-            log(`wwb: first frame uploaded (${width}x${height}), setData=${this._useSetData}`);
+            log(`wwb: first frame uploaded (${width}x${height}), setData=${this._useSetData}, ` +
+                `firstpx RGBA=${bytes[0]},${bytes[1]},${bytes[2]},${bytes[3]} ` +
+                `fmt=${fmt === (Cogl.PixelFormat && Cogl.PixelFormat.RGBX_8888) ? 'RGBX' : 'RGBA'}`);
         }
     }
 
@@ -441,9 +474,9 @@ export const LiveWallpaper = GObject.registerClass({
         const h = monitor?.height ?? backgroundActor.height;
         this.set_size(w, h);
 
-        // Visible until the first frame paints over it: proves the injection
-        // independently of the video path. The opaque texture covers it.
-        this.set_style('background-color: #0a0f1e;');
+        // No CSS background: an St.Widget background-color was occluding the
+        // painted texture (only the placeholder showed). Before the first frame
+        // the actor is simply transparent and the normal desktop shows through.
 
         // Meta.BackgroundActor has no layout manager, so a fixed-size child can
         // end up unallocated/invisible. BinLayout + x/y_expand fills it.
@@ -465,19 +498,34 @@ export const LiveWallpaper = GObject.registerClass({
             `bgActor ${backgroundActor.width}x${backgroundActor.height}`);
     }
 
+    // Without a CSS background or Clutter content, an St.Widget's paint volume
+    // is empty and Clutter CULLS the actor — vfunc_paint_node then never runs
+    // after the first paint, so the texture is never drawn. Claim the full
+    // allocation as our paint volume so we keep painting every frame.
+    vfunc_get_paint_volume(volume) {
+        volume.set_width(this.get_width());
+        volume.set_height(this.get_height());
+        return true;
+    }
+
     vfunc_paint_node(node, paintContext) {
-        // CSS background first (placeholder colour before the first frame).
         super.vfunc_paint_node(node, paintContext);
         const texture = this._source?.texture;
-        if (!texture)
-            return;
         const w = this.get_width();
         const h = this.get_height();
-        if (w <= 0 || h <= 0)
+        if (!this._loggedPaint) {
+            this._loggedPaint = true;
+            log(`wwb: paint_node called — tex=${!!texture} size=${w}x${h}`);
+        }
+        if (texture && !this._loggedPaintTex) {
+            this._loggedPaintTex = true;
+            log(`wwb: paint_node WITH texture — size=${w}x${h}, color=${!!whiteColor()}`);
+        }
+        if (!texture || w <= 0 || h <= 0)
             return;
         // Stretch to fill (MVP); 'fit'/'crop' modes adjust this rectangle later.
         const tnode = new Clutter.TextureNode(
-            texture, null,
+            texture, whiteColor(),
             Clutter.ScalingFilter.LINEAR, Clutter.ScalingFilter.LINEAR);
         const box = new Clutter.ActorBox();
         box.set_origin(0, 0);

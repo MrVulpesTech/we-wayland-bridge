@@ -290,3 +290,37 @@ done
   converging with Stage C). **Visual confirmation still needs the live session**
   (`mutter-devkit` viewer is not packaged → nested is headless/log-only). A
   careful live retry is now reasonable — operator's call, per 40.03.
+
+- **A second live test (2026-06-14) exposed Failure 4, then the freeze was
+  retired.** The interim hardening (texture reuse + 15 fps + overview pause)
+  held against the grey-screen and teardown crashes, but opening the overview
+  still froze the box: **`_createBackgroundActor` fires on every overview
+  toggle, and the per-actor pipeline design leaked a pipeline + timer each
+  time** (runaway VmRSS, `already disposed` spam, crash). Fix:
+  **one shared `FrameSource`** (single pipeline + Cogl texture) feeding thin
+  paint-only `LiveWallpaper` subscribers; cleanup via the `destroy` *signal*,
+  not a `destroy()` override. Verified in a 2-min nested overview-thrash stress
+  test: one pipeline, zero `already disposed`, VmRSS bounded ~508–613 MB, clean
+  disable with no GStreamer criticals, shell alive. Full writeup in `40.04`
+  (Failure 4 section).
+
+- **As of 2026-06-14, end of Session 4 (live) — THE WALLPAPER IS VISIBLE.**
+  A scene animates on the real GNOME background. Nested is headless, so three
+  rendering bugs only surfaced live, each fixed from one diagnostic log line
+  (see `session-04-live-wallpaper.md`, `40.02_consumer.md`):
+  1. **Culling** — no CSS bg + no content ⇒ empty paint volume ⇒
+     `vfunc_paint_node` stops being called. Fix: override
+     `vfunc_get_paint_volume` to claim the full allocation.
+  2. **Null `TextureNode` colour** paints transparent. Fix: explicit opaque
+     white `Cogl.Color`.
+  3. **Alpha = 0** (`firstpx RGBA=…,…,…,0`): BGRx→RGBA left alpha 0, so the
+     texture was see-through. Fix: upload as `Cogl.PixelFormat.RGBX_8888`
+     (ignore-alpha ⇒ opaque). **This was the actual "nothing on screen".**
+  Clean disable verified live (VmRSS 751→266 MB, `wwb: disabled`).
+  **Known limit:** laggy at native 2560×1440 — the SHM-copy path uploads a
+  ~14 MB texture per frame on the shell main thread. Correct picture, not
+  smooth. **Lowering producer res changes scene framing** (renderer frames to
+  its output size), so it is not a clean fit.
+  **Next, in order:** Stage C (dma-buf zero-copy) for smooth full-res — now the
+  priority; fit/crop modes; fullscreen-pause; multi-monitor; Q-10/#302.
+  The assistant still never runs gnome-shell.

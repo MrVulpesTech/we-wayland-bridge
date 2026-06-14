@@ -68,3 +68,4 @@ Numbered, append-only records of each working session. The plan in the
 brief runs four sessions to a minimal viable wallpaper.
 
 - [Session 01 — build & baseline](session-01-build.md)
+- [Session 04 — live wallpaper](session-04-live-wallpaper.md) — the scene animating on the real desktop; the incident closed and the live rendering-bug chain (cull, null colour, alpha=0/RGBX)
