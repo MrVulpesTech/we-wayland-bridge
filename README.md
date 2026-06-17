@@ -4,11 +4,11 @@
 
 **Status:** working prototype. A scene-type Wallpaper Engine wallpaper
 **renders and animates as the live GNOME Wayland background** on the reference
-machine (Ubuntu 26.04, GNOME Shell 50.1, Intel iGPU). The **zero-copy producer
-is proven** — it renders into a dma-buf and publishes it over PipeWire — but the
-**consumer uses an SHM copy**: a GNOME Shell extension (GJS) cannot import a
-dma-buf into Cogl, an architectural finding documented in
-[40.05](docs/40_bridge/40.05_dmabuf_zerocopy.md). The SHM path is tuned for
+machine (Ubuntu 26.04, GNOME Shell 50.1, Intel iGPU). The producer supports zero-copy via dma-buf (proven in Stage C); 
+the consumer currently uses an SHM copy. End-to-end zero-copy is 
+planned pending a dma-buf import path in the GNOME Shell extension API.
+
+The SHM path is tuned for
 daily use (reduced producer resolution + 20 fps; [40.03](docs/40_bridge/40.03_live_session_runbook.md)).
 See also [the session-4 log](docs/session-04-live-wallpaper.md).
 
@@ -62,10 +62,12 @@ The renderer is pulled in as a submodule, not forked — see
 ## Getting started
 
 ```sh
-git clone <repo-url> we-wayland-bridge
+git clone https://github.com/MrVulpesTech/we-wayland-bridge
 cd we-wayland-bridge
 git submodule update --init
 ```
+
+Build the producer: `cd we-wayland-bridge && bridge/build.sh`
 
 The two halves run as separate processes:
 
@@ -80,6 +82,24 @@ The two halves run as separate processes:
 
 The renderer reads Wallpaper Engine content you already own in Steam — this
 project ships no wallpaper assets.
+
+## Prerequisites
+
+- Ubuntu 26.04 or later (GNOME Shell 50, Wayland session)
+- Wallpaper Engine installed via Steam (App ID 431960, scene-type wallpapers subscribed)
+- PipeWire (default on Ubuntu 26.04)
+- GStreamer 1.x with PipeWire plugin (gstreamer1.0-pipewire)
+- Build tools: cmake, pkg-config, libgbm-dev, libegl-dev, libpipewire-0.3-dev (full list in docs/40_bridge/40.01_producer.md)
+
+## Known limitations
+
+- Scene-type wallpapers only (video and web types not supported)
+- Single monitor
+- No mouse interactivity (parallax/hover effects)
+- No audio reactivity  
+- No autostart (manual launch required for now)
+- ~30fps at 1080p on Intel iGPU (hardware renderer limit on Linux)
+- Consumer uses SHM copy; end-to-end zero-copy is planned
 
 ## Scope
 

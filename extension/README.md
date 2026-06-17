@@ -29,9 +29,9 @@ over PipeWire only. **Licence: MIT** (ADR-0002).
 - Reuses one texture (`set_data` per frame, no per-frame allocation), throttled
   to ~15 fps, and **pauses uploads while the overview is open**.
 
-## Hard-won facts (GNOME 50.1)
+## Implementation notes (GNOME 50.1)
 
-These are easy to get wrong and cost real debugging (details in `40.02`):
+Important technical details for this environment (details in `40.02`):
 
 - **`import GstApp`** or `appsink.try_pull_sample` is unbound and throws.
 - Upload as **`Cogl.PixelFormat.RGBX_8888`, not RGBA** — the producer is BGRx and

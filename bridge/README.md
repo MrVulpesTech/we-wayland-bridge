@@ -11,9 +11,10 @@ stream. This is the renderer side of the pipe.
 
 > **Status: working (Stage A + B).** The host renders offscreen via the core
 > embedding API (`wp_project_set_output_framebuffer` + `wp_render_frame`) and
-> streams BGRx frames over PipeWire (SHM-copied, PTS-stamped), consumed live by
-> the extension and by `gst-launch`. **Stage C (dma-buf zero-copy)** is the next
-> step and the priority — it removes the per-frame copy. Full detail:
+> streams BGRx frames over PipeWire (PTS-stamped), consumed live by
+> the extension and by `gst-launch`. The producer supports zero-copy via dma-buf (proven in Stage C); 
+> the consumer currently uses an SHM copy. End-to-end zero-copy is 
+> planned pending a dma-buf import path in the GNOME Shell extension API. Full detail:
 > [`docs/40_bridge/40.01_producer.md`](../docs/40_bridge/40.01_producer.md).
 
 ## Layout
