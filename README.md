@@ -2,7 +2,7 @@
 
 > Wallpaper Engine live wallpapers on GNOME Shell under Wayland.
 
-<video src="https://github.com/MrVulpesTech/we-wayland-bridge/releases/download/v0.1.0/demo.mp4" autoplay loop muted playsinline>
+<video src="https://github.com/user-attachments/assets/14587281-19fa-4ea6-b008-027e57dcc836" autoplay loop muted playsinline>
 </video>
 
 **Status:** working prototype. A scene-type Wallpaper Engine wallpaper
