@@ -2,7 +2,15 @@
 
 > Wallpaper Engine live wallpapers on GNOME Shell under Wayland.
 
-**Status:** pre-alpha. Architecture and documentation phase.
+**Status:** working prototype. A scene-type Wallpaper Engine wallpaper
+**renders and animates as the live GNOME Wayland background** on the reference
+machine (Ubuntu 26.04, GNOME Shell 50.1, Intel iGPU). The **zero-copy producer
+is proven** — it renders into a dma-buf and publishes it over PipeWire — but the
+**consumer uses an SHM copy**: a GNOME Shell extension (GJS) cannot import a
+dma-buf into Cogl, an architectural finding documented in
+[40.05](docs/40_bridge/40.05_dmabuf_zerocopy.md). The SHM path is tuned for
+daily use (reduced producer resolution + 20 fps; [40.03](docs/40_bridge/40.03_live_session_runbook.md)).
+See also [the session-4 log](docs/session-04-live-wallpaper.md).
 
 Wallpaper Engine is a Windows application; its animated wallpapers are
 bought through the Steam Workshop. On Linux,
@@ -59,11 +67,19 @@ cd we-wayland-bridge
 git submodule update --init
 ```
 
-There is nothing to run yet beyond the upstream renderer itself; the
-build and a first wallpaper in a window are
-[Session 1](docs/session-01-build.md). The renderer reads Wallpaper
-Engine content you already own in Steam — this project ships no wallpaper
-assets.
+The two halves run as separate processes:
+
+1. **Producer** — build and start the renderer host (`bridge/`), which streams
+   frames over PipeWire. Build/run in
+   [`docs/40_bridge/40.01_producer.md`](docs/40_bridge/40.01_producer.md).
+2. **Consumer** — the GNOME extension (`extension/`) paints that stream into the
+   background layer. To watch it on the real desktop, follow the operator
+   runbook in
+   [`docs/40_bridge/40.03_live_session_runbook.md`](docs/40_bridge/40.03_live_session_runbook.md)
+   (start order, recovery, kill-switch).
+
+The renderer reads Wallpaper Engine content you already own in Steam — this
+project ships no wallpaper assets.
 
 ## Scope
 

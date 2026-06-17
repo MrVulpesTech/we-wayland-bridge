@@ -6,17 +6,24 @@
 # fed only by its stream. Handles the dynamic node id for you (it changes
 # every run, so a hard-coded `path=` from a previous run will not work).
 #
-# Usage: bridge/demo.sh [wallpaper-folder] [WxH] [fps]
-#   defaults: astronaut scene, 1920x1080, 60 fps
+# Usage: bridge/demo.sh <wallpaper-folder> [WxH] [fps]
+#   e.g. bridge/demo.sh steam-workshop/<workshop-id> 1920x1080 30
+#   defaults: 1920x1080, 30 fps. The wallpaper folder is required.
 # Render the producer at 1080p+ — some scenes wash out at low resolution
 # (Q-12 / 40.01). Ctrl-C stops both the viewer and the producer.
 set -euo pipefail
 
+if [ "$#" -lt 1 ]; then
+    echo "usage: bridge/demo.sh <wallpaper-folder> [WxH] [fps]" >&2
+    echo "  e.g. bridge/demo.sh steam-workshop/<workshop-id> 1920x1080 30" >&2
+    exit 1
+fi
+
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
-WP="${1:-$root/steam-workshop/2804205787}"
+WP="$1"
 SIZE="${2:-1920x1080}"
-FPS="${3:-60}"
+FPS="${3:-30}"
 LOG="$(mktemp /tmp/wpe-demo.XXXXXX.log)"
 
 "$here/build/host/wpe-host" --pipewire --assets-dir "$root/steam-assets" \

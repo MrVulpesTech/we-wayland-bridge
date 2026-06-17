@@ -1,0 +1,23 @@
+# Licensing
+
+we-wayland-bridge is split across a per-directory license boundary (ADR-0002),
+because its two halves run as separate processes and only one of them links the
+GPLv3 renderer.
+
+- **`bridge/`** — the frame producer. It links `linux-wallpaperengine-core`
+  (GPLv3), so it is **GPL-3.0-or-later**. Full text: [`bridge/LICENSE`](bridge/LICENSE).
+
+- **`extension/`** — the GNOME Shell extension. A separate process that consumes
+  a PipeWire stream and links no renderer code, so it is **MIT**. Full text:
+  [`extension/LICENSE`](extension/LICENSE).
+
+- **`docs/`, build scripts, and other top-level files** follow the license of
+  the component they belong to, as marked by each file's `SPDX-License-Identifier`
+  header.
+
+The boundary is the PipeWire stream between the two processes; see
+[`docs/_adr/ADR-0002-licensing.md`](docs/_adr/ADR-0002-licensing.md).
+
+`upstream/` and `next-v2-review/` are the `linux-wallpaperengine` submodule /
+worktree and carry their own upstream license; they are not part of this
+repository's licensed source.

@@ -24,10 +24,10 @@
 //  - The shared texture is allocated on the first frame and updated in place
 //    (set_data) every frame thereafter — no per-frame allocation. Subscribers
 //    paint it directly in vfunc_paint_node (Clutter.TextureNode).
-//  - Churn guards (all 40.04 Failure 2): upload throttled to ~15 fps and paused
-//    entirely while the overview is open.
-//  - A solid fallback colour shows until the first frame, so the
-//    background-layer injection is verifiable independently of the video path.
+//  - Churn guards (all 40.04 Failure 2): the upload is rate-capped
+//    (FRAME_INTERVAL_MS) and paused entirely while the overview is open.
+//  - Before the first frame the actor is transparent (the normal desktop shows
+//    through); the texture is painted over it once frames arrive.
 
 import Clutter from 'gi://Clutter';
 import Cogl from 'gi://Cogl';
@@ -39,10 +39,12 @@ import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-// Upload at most ~15 fps regardless of the producer's rate (40.04 Failure 2:
-// halve the per-frame GPU work vs the old 30 Hz poll). drop=true on the appsink
-// means we always get the most recent frame, never a backlog.
-const FRAME_INTERVAL_MS = 67; // 1000 / 15
+// Upload-rate cap (40.04 Failure 2: bound the per-frame GPU work). 20 fps is a
+// safe daily-use default, paired with a reduced producer resolution (40.03) so
+// the per-frame copy stays small; the SHM upload cost is resolution × rate and
+// the resolution drop dominates. 30 fps (33 ms) is fine on capable hardware.
+// drop=true on the appsink keeps us on the latest frame, never a backlog.
+const FRAME_INTERVAL_MS = 50; // 1000 / 20
 
 // Producer frames are BGRx → videoconvert → RGBA, but the alpha byte can arrive
 // as 0 (fully transparent), which paints an invisible texture. Upload in an X
@@ -305,7 +307,7 @@ export class FrameSource {
         const ret = this._pipeline.set_state(Gst.State.PLAYING);
         log(`wwb: pipeline (${this._srcDesc}) set_state(PLAYING) => ${ret}`);
 
-        // The ONLY poll timer in the extension. Throttled to ~15 fps.
+        // The ONLY poll timer in the extension (FRAME_INTERVAL_MS rate cap).
         this._pollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FRAME_INTERVAL_MS, () => {
             this._pullFrame();
             return GLib.SOURCE_CONTINUE;
@@ -400,9 +402,7 @@ export class FrameSource {
 
         if (!this._loggedUpload) {
             this._loggedUpload = true;
-            log(`wwb: first frame uploaded (${width}x${height}), setData=${this._useSetData}, ` +
-                `firstpx RGBA=${bytes[0]},${bytes[1]},${bytes[2]},${bytes[3]} ` +
-                `fmt=${fmt === (Cogl.PixelFormat && Cogl.PixelFormat.RGBX_8888) ? 'RGBX' : 'RGBA'}`);
+            log(`wwb: first frame uploaded (${width}x${height}), setData=${this._useSetData}`);
         }
     }
 
@@ -513,13 +513,9 @@ export const LiveWallpaper = GObject.registerClass({
         const texture = this._source?.texture;
         const w = this.get_width();
         const h = this.get_height();
-        if (!this._loggedPaint) {
+        if (texture && !this._loggedPaint) {
             this._loggedPaint = true;
-            log(`wwb: paint_node called — tex=${!!texture} size=${w}x${h}`);
-        }
-        if (texture && !this._loggedPaintTex) {
-            this._loggedPaintTex = true;
-            log(`wwb: paint_node WITH texture — size=${w}x${h}, color=${!!whiteColor()}`);
+            log(`wwb: painting texture (${w}x${h})`);
         }
         if (!texture || w <= 0 || h <= 0)
             return;

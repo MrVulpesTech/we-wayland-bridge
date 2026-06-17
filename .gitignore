@@ -1,2 +1,8 @@
+# Operator's Steam data (gitignored symlinks — never commit, see ADR / non-goals)
 steam-workshop
 steam-assets
+
+# Build worktree of the linux-wallpaperengine submodule at the pinned next-v2
+# commit (PR #609). On disk as a build dependency of bridge/, never committed.
+# See CLAUDE.md and docs/40_bridge/40.01_producer.md.
+next-v2-review/

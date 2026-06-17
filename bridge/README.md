@@ -1,12 +1,44 @@
 # bridge/
 
-Renderer-side work: the headless → PipeWire output backend for
-`linux-wallpaperengine`, as patches and notes. Developed on the
-`pipewire-backend` fork branch of upstream and mirrored here; the goal is
-a pull request into upstream.
+The producer: a headless host that embeds `linux-wallpaperengine-core`, renders
+a Wallpaper Engine scene into an offscreen framebuffer, and publishes the frames
+as a PipeWire `Video/Source`. The GNOME extension (`extension/`) consumes that
+stream. This is the renderer side of the pipe.
 
 **Licence: GPLv3-or-later** (derived from the upstream renderer). See
 [ADR-0002](../docs/_adr/ADR-0002-licensing.md) and
 [ADR-0003](../docs/_adr/ADR-0003-output-backend.md).
 
-Empty until Session 2 scopes the backend.
+> **Status: working (Stage A + B).** The host renders offscreen via the core
+> embedding API (`wp_project_set_output_framebuffer` + `wp_render_frame`) and
+> streams BGRx frames over PipeWire (SHM-copied, PTS-stamped), consumed live by
+> the extension and by `gst-launch`. **Stage C (dma-buf zero-copy)** is the next
+> step and the priority — it removes the per-frame copy. Full detail:
+> [`docs/40_bridge/40.01_producer.md`](../docs/40_bridge/40.01_producer.md).
+
+## Layout
+
+- `host/main.cpp` — the host (surfaceless EGL GL context, core embedding,
+  PipeWire `Video/Source`, `node.name=wpe-host`).
+- `build.sh` — one-command build (builds core with webhelper/frontend/dev-viewer
+  /tests OFF, then the host). Output in `build/` (gitignored).
+
+## Build and run
+
+```sh
+bridge/build.sh                       # build core + host
+bridge/build/host/wpe-host --pipewire --assets-dir steam-assets \
+  --size 2560x1440 --fps 30 steam-workshop/<id>
+```
+
+Flags: `--size WxH` / `--width` / `--height`, `--fps`, `--frames`, `--pipewire`,
+`--out <dir>` (PNG dump), `--readback-all`. Run scenes at **1080p+** (Q-12
+washout below that). The host prints its PipeWire node id, but the extension
+finds it by `node.name`.
+
+## Build dependency
+
+The host builds against `next-v2-review/` — a git worktree of the upstream
+submodule pinned at the PR #609 head (`828485a`), with its `External/` submodules
+populated. It is on disk, gitignored, and **must not be removed** while working
+on the producer (`CLAUDE.md` State has the rebuild-from-scratch note).

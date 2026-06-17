@@ -56,9 +56,11 @@ export default class WeWaylandBridgeExtension extends Extension {
         try {
             this._enableInner();
         } catch (e) {
-            logError(e, 'wwb: enable() failed — extension is a no-op this session');
-            try { this._injectionManager?.clear(); } catch (_e) {}
-            this._injectionManager = null;
+            logError(e, 'wwb: enable() failed — tearing down to a clean no-op');
+            // _enableInner may have already connected signals, added timers, or
+            // created the FrameSource before throwing. disable() is guarded
+            // against undefined fields, so it cleans up whatever exists.
+            try { this.disable(); } catch (_e) {}
         }
     }
 
@@ -121,30 +123,11 @@ export default class WeWaylandBridgeExtension extends Extension {
             return GLib.SOURCE_REMOVE;
         });
 
-        // Stress hook for NESTED TESTING ONLY (never set in production):
-        // WWB_STRESS=1 toggles the overview every 2s so a headless devkit
-        // session exercises the overview GL load + our overview-pause path
-        // without needing Eval/unsafe mode. See docs/40_bridge/40.04.
-        if (GLib.getenv('WWB_STRESS')) {
-            let open = false;
-            this._stressId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 2, () => {
-                open = !open;
-                try { open ? Main.overview.show() : Main.overview.hide(); }
-                catch (e) { logError(e, 'wwb: stress overview toggle failed'); }
-                return GLib.SOURCE_CONTINUE;
-            });
-            log('wwb: WWB_STRESS set — toggling overview every 2s (nested test only)');
-        }
-
         log(`wwb: enabled (${Main.layoutManager.monitors.length} monitors, ` +
             `${this._wallpapers.size} wallpaper actors attached)`);
     }
 
     disable() {
-        if (this._stressId) {
-            GLib.source_remove(this._stressId);
-            this._stressId = 0;
-        }
         if (this._startId) {
             GLib.source_remove(this._startId);
             this._startId = 0;

@@ -102,7 +102,7 @@ Exact working command (scene, verified):
 ```sh
 cd upstream/build/output
 ./linux-wallpaperengine \
-  --assets-dir /home/frieren/projects/we-wayland-bridge/steam-assets \
+  --assets-dir ~/projects/we-wayland-bridge/steam-assets \
   --silent --fps 30 \
   --screenshot /tmp/shot.png --screenshot-delay 30 \
   2804205787

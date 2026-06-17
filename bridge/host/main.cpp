@@ -10,15 +10,17 @@
 // This file links the GPLv3 core library, so it is GPLv3 (ADR-0002). The GNOME
 // extension that will consume the PipeWire stream is a separate process (MIT).
 //
-// Stage B uses a glReadPixels->SHM copy path (correctness first). Stage C
-// (--dmabuf) backs the output FBO with a gbm/dma-buf so the frame never leaves
-// the GPU; C-1 (current) wires the allocation, EGL-image import, and dma-buf
-// export and verifies them in dump mode (no PipeWire changes yet).
+// Stage B uses a glReadPixels->SHM copy path (the production default). Stage C
+// (--dmabuf) backs the output FBO with a pool of gbm/dma-bufs and publishes them
+// over PipeWire so the frame never leaves the GPU — producer-side zero-copy is
+// proven. A GNOME consumer that imports the dma-buf is a separate, open question
+// (docs/40_bridge/40.05); --shm forces the SHM path.
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -90,6 +92,7 @@ struct Options {
     bool pipewire = false;     // Stage B: run as a PipeWire video source
     bool dmabuf = false;       // Stage C: back the output FBO with a gbm/dma-buf
     bool shm = false;          // force the SHM (glReadPixels) transport even with --dmabuf
+    bool verbose = false;      // print the per-second production-rate line
 };
 
 Options parse_args (int argc, char** argv) {
@@ -117,12 +120,13 @@ Options parse_args (int argc, char** argv) {
         else if (a == "--pipewire") o.pipewire = true;
         else if (a == "--dmabuf") o.dmabuf = true;
         else if (a == "--shm") o.shm = true;
+        else if (a == "--verbose") o.verbose = true;
         else if (a[0] == '-') die ("unknown flag");
         else o.wallpaper = a;
     }
     if (o.wallpaper.empty ())
-        die ("usage: wpe-host [--pipewire] [--dmabuf] [--shm] [--assets-dir D] [--size WxH] "
-             "[--width W] [--height H] [--frames N] [--fps F] [--out DIR] <wallpaper-folder>");
+        die ("usage: wpe-host [--pipewire] [--dmabuf] [--shm] [--verbose] [--assets-dir D] "
+             "[--size WxH] [--width W] [--height H] [--frames N] [--fps F] [--out DIR] <wallpaper-folder>");
     return o;
 }
 
@@ -162,7 +166,7 @@ struct Gfx {
 
     // Stage C: a pool of dma-buf render targets (when dmabuf == true).
     bool dmabuf = false;
-    int drm_fd = -1; // /dev/dri/renderD128
+    int drm_fd = -1; // DRM render node fd
     gbm_device* gbm = nullptr;
     std::vector<DmaBuf> pool;
 };
@@ -276,8 +280,17 @@ void gfx_init_dmabuf_pool (Gfx& g, int count) {
     if (!has_import) die ("EGL display lacks EGL_EXT_image_dma_buf_import");
     load_dmabuf_procs ();
 
-    g.drm_fd = open ("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
-    if (g.drm_fd < 0) die ("open(/dev/dri/renderD128) failed");
+    // The render node is renderD128 on most machines, but that is not
+    // guaranteed (multi-GPU, different enumeration). Try the conventional range
+    // and use the first node that opens.
+    for (int i = 128; i <= 135 && g.drm_fd < 0; i++) {
+        char path[64];
+        std::snprintf (path, sizeof (path), "/dev/dri/renderD%d", i);
+        g.drm_fd = open (path, O_RDWR | O_CLOEXEC);
+        if (g.drm_fd >= 0)
+            std::fprintf (stderr, "using DRM render node %s\n", path);
+    }
+    if (g.drm_fd < 0) die ("no usable DRM render node (/dev/dri/renderD128..135)");
     g.gbm = gbm_create_device (g.drm_fd);
     if (!g.gbm) die ("gbm_create_device failed");
 
@@ -391,6 +404,7 @@ struct PwState {
     int fps = 60;
     double start_ms = 0.0;
     bool dmabuf = false; // transport: dma-buf (zero-copy) vs SHM (glReadPixels)
+    bool verbose = false; // print the per-second production-rate line
     int next_buf = 0;    // next pool index to hand out in pw_on_add_buffer
 };
 
@@ -446,17 +460,20 @@ void pw_on_process (void* userdata) {
     }
     pw_stream_queue_buffer (s->stream, b);
 
-    // Report actual production rate once a second.
-    static long produced = 0;
-    static double window_start = 0.0;
-    double now = monotonic_ms ();
-    if (window_start == 0.0) window_start = now;
-    produced++;
-    if (now - window_start >= 1000.0) {
-        std::fprintf (stderr, "producing %.1f fps, virtual_time=%.2fs\n",
-                      produced * 1000.0 / (now - window_start), g_virtual_time);
-        produced = 0;
-        window_start = now;
+    // Report actual production rate once a second (--verbose only; otherwise
+    // this is a line of stderr per second forever, which spams a service log).
+    if (s->verbose) {
+        static long produced = 0;
+        static double window_start = 0.0;
+        double now = monotonic_ms ();
+        if (window_start == 0.0) window_start = now;
+        produced++;
+        if (now - window_start >= 1000.0) {
+            std::fprintf (stderr, "producing %.1f fps, virtual_time=%.2fs\n",
+                          produced * 1000.0 / (now - window_start), g_virtual_time);
+            produced = 0;
+            window_start = now;
+        }
     }
 }
 
@@ -495,9 +512,9 @@ void pw_on_remove_buffer (void* userdata, pw_buffer* b) {
     if (d->fd >= 0) { close (static_cast<int> (d->fd)); d->fd = -1; }
 }
 
-// Build a dma-buf EnumFormat pod: RGBx (opaque; the dma-buf is ABGR8888, same
-// byte layout, x ignores the scene's alpha=0) with a mandatory LINEAR modifier
-// — the modifier property is what signals "this is dma-buf" to the consumer.
+// Build a dma-buf EnumFormat pod: RGBx (opaque; the dma-buf is XBGR8888 — the x
+// ignores the scene's alpha=0) with a mandatory LINEAR modifier — the modifier
+// property is what signals "this is dma-buf" to the consumer.
 const spa_pod* build_format_dmabuf (spa_pod_builder* bld, int w, int h, int fps) {
     spa_rectangle size = SPA_RECTANGLE (static_cast<uint32_t> (w), static_cast<uint32_t> (h));
     spa_fraction rate = SPA_FRACTION (static_cast<uint32_t> (fps), 1);
@@ -591,6 +608,7 @@ int run_pipewire (const Options& opt, Gfx& gfx, wp_context* ctx, wp_project* pro
     s.project = project;
     s.fps = opt.fps;
     s.dmabuf = opt.dmabuf && !opt.shm; // dma-buf FBO + not forced back to SHM
+    s.verbose = opt.verbose;
     s.loop = pw_main_loop_new (nullptr);
     if (!s.loop) die ("pw_main_loop_new failed");
 
@@ -650,8 +668,9 @@ int run_pipewire (const Options& opt, Gfx& gfx, wp_context* ctx, wp_project* pro
 // ---------------------------------------------------------------------------
 int run_dump (const Options& opt, Gfx& gfx, wp_context* ctx, wp_project* project) {
     std::vector<unsigned char> pixels (static_cast<size_t> (opt.width) * opt.height * 4);
-    std::string mkout = "mkdir -p '" + opt.out + "'";
-    if (std::system (mkout.c_str ()) != 0) die ("could not create out dir");
+    std::error_code ec;
+    std::filesystem::create_directories (opt.out, ec);
+    if (ec) die ("could not create out dir");
 
     double total_ms = 0.0, total_readback_ms = 0.0;
     const char* fixed = std::getenv ("WPE_FIXED_TIME");
