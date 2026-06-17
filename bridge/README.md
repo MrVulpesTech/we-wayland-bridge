@@ -9,7 +9,7 @@ stream. This is the renderer side of the pipe.
 [ADR-0002](../docs/_adr/ADR-0002-licensing.md) and
 [ADR-0003](../docs/_adr/ADR-0003-output-backend.md).
 
-> **Status: working (Stage A + B).** The host renders offscreen via the core
+> **Status: working (Stage A + B + C producer).** The host renders offscreen via the core
 > embedding API (`wp_project_set_output_framebuffer` + `wp_render_frame`) and
 > streams BGRx frames over PipeWire (PTS-stamped), consumed live by
 > the extension and by `gst-launch`. The producer supports zero-copy via dma-buf (proven in Stage C); 
@@ -27,15 +27,16 @@ stream. This is the renderer side of the pipe.
 ## Build and run
 
 ```sh
-bridge/build.sh                       # build core + host
+./bridge/build.sh                       # build core + host
 bridge/build/host/wpe-host --pipewire --assets-dir steam-assets \
   --size 2560x1440 --fps 30 steam-workshop/<id>
 ```
 
 Flags: `--size WxH` / `--width` / `--height`, `--fps`, `--frames`, `--pipewire`,
-`--out <dir>` (PNG dump), `--readback-all`. Run scenes at **1080p+** (Q-12
-washout below that). The host prints its PipeWire node id, but the extension
-finds it by `node.name`.
+`--dmabuf` (zero-copy dma-buf transport), `--shm` (force the SHM path),
+`--verbose` (per-second fps line), `--out <dir>` (PNG dump), `--readback-all`.
+Run scenes at **1080p+** (Q-12 washout below that). The host prints its PipeWire
+node id, but the extension finds it by `node.name`.
 
 ## Build dependency
 

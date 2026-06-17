@@ -16,7 +16,7 @@ over PipeWire only. **Licence: MIT** (ADR-0002).
 - Overrides `Background.BackgroundManager._createBackgroundActor` and adds a
   `LiveWallpaper` actor to each monitor's background actor (the only sanctioned
   background-layer path on GNOME Wayland). No window cloning, so none of the
-  overview/Alt-Tab/app-hiding overrides Hanabi and the kv9898 fork need.
+  overview/Alt-Tab/app-hiding overrides needed by Hanabi and the kv9898 fork are required here.
 - A single shared `FrameSource` owns the **only** GStreamer pipeline
   (`pipewiresrc ! videoconvert ! RGBA ! appsink`), poll timer, and Cogl texture.
   Each `LiveWallpaper` is a thin, pipeline-less subscriber that paints the shared
@@ -26,14 +26,14 @@ over PipeWire only. **Licence: MIT** (ADR-0002).
 - Polls the appsink from a GLib timer on the **shell main thread**
   (`try_pull_sample`), so Clutter is never touched from GStreamer's streaming
   thread.
-- Reuses one texture (`set_data` per frame, no per-frame allocation), throttled
-  to ~15 fps, and **pauses uploads while the overview is open**.
+- Reuses one texture (`set_data` per frame, no per-frame allocation), rate-capped
+  (20 fps by default), and **pauses uploads while the overview is open**.
 
 ## Implementation notes (GNOME 50.1)
 
 Important technical details for this environment (details in `40.02`):
 
-- **`import GstApp`** or `appsink.try_pull_sample` is unbound and throws.
+- You must **`import GstApp`**, otherwise `appsink.try_pull_sample` is unbound and throws an exception.
 - Upload as **`Cogl.PixelFormat.RGBX_8888`, not RGBA** — the producer is BGRx and
   `videoconvert` leaves alpha at 0, so an RGBA texture paints fully transparent.
 - Override **`vfunc_get_paint_volume`** to claim the allocation, or Clutter culls
@@ -44,7 +44,7 @@ Important technical details for this environment (details in `40.02`):
 - A bare `pipewiresrc` is **not** auto-linked; the source finds the producer by
   `node.name=wpe-host` via `Gst.DeviceMonitor`.
 - Tear pipelines down to NULL and **wait** before releasing — disposing a
-  PLAYING pipewiresrc SIGSEGV'd the shell.
+  PLAYING pipewiresrc will cause the shell to SIGSEGV.
 
 ## Safety
 
@@ -83,16 +83,19 @@ kill-switch). The assistant never launches gnome-shell — the operator does.
    (no on-screen window), so verify by the journal:
 
    ```sh
-   dbus-run-session -- gnome-shell --devkit --wayland --virtual-monitor 1920x1080
+   dbus-run-session -- gnome-shell --devkit --wayland --virtual-monitor 1920x1080 &
    journalctl --user -f -o cat | grep -i wwb
    ```
+   Or open a second terminal for the `journalctl` command.
 
    Expected: `wwb: enabled` → `pipeline … set_state(PLAYING)` →
-   `first frame uploaded (WxH), setData=true`. `WWB_STRESS=1` toggles the
-   overview every 2 s (nested stress testing only; never set in production).
+   `first frame uploaded (WxH), setData=true`.
 
 ## Follow-ups
 
-Stage C (dma-buf zero-copy, for smooth full-res — the priority); fit/crop modes;
-per-scene properties (`--set-property`); pointer forwarding (mouse-interactive
-scenes); audio-reactivity; multi-monitor; fullscreen-pause. See `40.02` §5.
+Planned: consumer-side dma-buf import for end-to-end zero-copy — the producer
+half is proven (`--dmabuf`), but a GJS extension cannot import a dma-buf into
+Cogl, so this is blocked pending a GNOME API or a window-clone approach
+(`docs/40_bridge/40.05`). Also: fit/crop modes; per-scene properties
+(`--set-property`); pointer forwarding (mouse-interactive scenes);
+audio-reactivity; multi-monitor; fullscreen-pause. See `40.02` §5.

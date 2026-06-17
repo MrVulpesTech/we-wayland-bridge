@@ -3,7 +3,7 @@
 > Wallpaper Engine live wallpapers on GNOME Shell under Wayland.
 
 **Status:** working prototype. A scene-type Wallpaper Engine wallpaper
-**renders and animates as the live GNOME Wayland background** on the reference
+**renders and animates on the GNOME Wayland desktop background** on the reference
 machine (Ubuntu 26.04, GNOME Shell 50.1, Intel iGPU). The producer supports zero-copy via dma-buf (proven in Stage C); 
 the consumer currently uses an SHM copy. End-to-end zero-copy is 
 planned pending a dma-buf import path in the GNOME Shell extension API.
@@ -12,7 +12,7 @@ The SHM path is tuned for
 daily use (reduced producer resolution + 20 fps; [40.03](docs/40_bridge/40.03_live_session_runbook.md)).
 See also [the session-4 log](docs/session-04-live-wallpaper.md).
 
-Wallpaper Engine is a Windows application; its animated wallpapers are
+Wallpaper Engine is a Windows application; its live wallpapers are
 bought through the Steam Workshop. On Linux,
 [`linux-wallpaperengine`](https://github.com/Almamu/linux-wallpaperengine)
 already reimplements the runtime and renders those wallpapers with OpenGL.
@@ -27,7 +27,7 @@ icons. The only sanctioned background-layer path on GNOME Wayland is a
 
 This project is the bridge between the working renderer and GNOME Shell:
 it gets frames out of `linux-wallpaperengine` and into a Clutter actor in
-the GNOME background layer, without an expensive per-frame copy.
+the GNOME background layer, ultimately without an expensive per-frame copy (currently uses an SHM fallback).
 
 ## Architecture
 
@@ -39,7 +39,7 @@ Wallpaper Engine files (Steam) → linux-wallpaperengine renderer
 ```
 
 The renderer and `gnome-shell` are separate processes. Frames cross
-between them over PipeWire — which is also the licence boundary: the
+between them via PipeWire, which also serves as the licensing boundary: the
 renderer-side code is GPLv3, the extension is MIT.
 
 See [`docs/MEMORY.md`](docs/MEMORY.md) for the full design, starting with
@@ -67,7 +67,7 @@ cd we-wayland-bridge
 git submodule update --init
 ```
 
-Build the producer: `cd we-wayland-bridge && bridge/build.sh`
+Build the producer: `./bridge/build.sh`
 
 The two halves run as separate processes:
 
@@ -111,8 +111,9 @@ single monitor, no web wallpapers, no audio-reactivity. See
 
 Renderer-derived code (`bridge/`) is GPLv3, matching upstream. The GNOME
 extension (`extension/`) is a separate process and is MIT. See
-[ADR-0002](docs/_adr/ADR-0002-licensing.md). `LICENSE` files are added
-before the repository goes public.
+[ADR-0002](docs/_adr/ADR-0002-licensing.md) and the root [`LICENSE`](LICENSE),
+which points to [`bridge/LICENSE`](bridge/LICENSE) (GPL-3.0) and
+[`extension/LICENSE`](extension/LICENSE) (MIT).
 
 ## Legal
 
@@ -120,4 +121,8 @@ This project renders Wallpaper Engine content that the user has legally
 purchased and installed through Steam — the same footing on which
 `linux-wallpaperengine` has operated for years. It redistributes no
 Wallpaper Engine code or assets. You must own Wallpaper Engine on Steam
-and have subscribed to the wallpapers you use.
+and have subscribed to the live wallpapers you use.
+
+## Acknowledgements
+
+The initial prototype and documentation for this project were developed with the assistance of an AI coding agent (Claude).

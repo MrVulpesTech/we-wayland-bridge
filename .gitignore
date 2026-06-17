@@ -6,3 +6,7 @@ steam-assets
 # commit (PR #609). On disk as a build dependency of bridge/, never committed.
 # See CLAUDE.md and docs/40_bridge/40.01_producer.md.
 next-v2-review/
+
+# Internal AI planning/session files
+CLAUDE.md
+we-wayland-bridge-summary-en.md
